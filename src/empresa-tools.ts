@@ -33,6 +33,21 @@ import { getSql } from './db';
  * Todo el matching de texto usa `unaccent(columna) ilike unaccent(termino)` en ambos lados -
  * Postgres, a diferencia de MySQL, distingue tildes en ILIKE (bug real encontrado y corregido acá
  * y en `search_taxonomy` de Fase MCP-1 - ver ese archivo).
+ *
+ * Fallback de tolerancia a errores de tipeo (11 sep 2026, inspirado en el approach hibrido de
+ * Mercadona Tech - https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, adaptado a
+ * nuestra escala real de 406 empresas/112 servicios, muy lejos de sus millones de busquedas):
+ * `search_empresas`/`get_empresa` intentan primero el match exacto/parcial de siempre (ILIKE). Si
+ * esa pasada no devuelve NADA y el usuario dio texto libre (query/sector/ciudad/nombre), se repite
+ * la misma busqueda con `similarity()`/`word_similarity()` de la extension `pg_trgm` (YA estaba
+ * instalada en este proyecto de Supabase, v1.6 - no fue necesario habilitarla) - tolera
+ * transposiciones/letras de mas o de menos ("consturccion" -> CONSTRUCCIÓN) sin necesidad de un
+ * modelo de embeddings para esto (eso ya lo resuelve `search_taxonomy` para sinonimos/conceptos,
+ * que es un problema distinto al de errores de tipeo). No se creo indice GIN de trigramas: con
+ * este volumen de filas un sequential scan es instantaneo, un indice seria complejidad sin
+ * beneficio medible. Cada fila devuelta en modo fallback trae `match_type: 'fuzzy'` (las del modo
+ * normal traen `match_type: 'exact'`) para que quien consuma la tool pueda distinguir un match
+ * literal de uno aproximado - mismo patron que `match_type` en `search_taxonomy`.
  */
 
 /** Columnas + joins compartidos entre las 3 queries de este archivo - evita repetir el mismo SQL 3 veces. */
@@ -104,40 +119,77 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			const max = limit ?? 20;
 			const sql = getSql(env);
 
-			try {
+			// Umbral de similitud de pg_trgm - 0.35 es mas permisivo que el default de la extension
+			// (0.3 para similarity(), pero word_similarity() suele pedir un poco mas para no generar
+			// falsos positivos con nombres de empresa largos). Ajustado a mano contra los sectores/
+			// servicios/empresas reales de este proyecto, no es un valor de libreria.
+			const TRGM_THRESHOLD = 0.35;
+
+			/** Arma el WHERE - `fuzzy=false` es el ILIKE exacto de siempre; `fuzzy=true` es el fallback por similitud. */
+			function buildConditions(fuzzy: boolean) {
 				const conditions = [sql`e.status_id = 1`];
 
 				if (query) {
-					const like = `%${query}%`;
-					conditions.push(sql`(
-						unaccent(e.name) ilike unaccent(${like})
-						or exists (
-							select 1 from empresa_sector_service ess
-							join services sv on sv.id = ess.service_id
-							where ess.empresa_id = e.id and unaccent(sv.name) ilike unaccent(${like})
-						)
-						or exists (
-							select 1 from empresa_sector_service ess
-							join services sv on sv.id = ess.service_id
-							join sectors s on s.id = sv.sectors_id
-							where ess.empresa_id = e.id and unaccent(s.name) ilike unaccent(${like})
-						)
-					)`);
+					conditions.push(
+						fuzzy
+							? sql`(
+								word_similarity(unaccent(${query}), unaccent(e.name)) > ${TRGM_THRESHOLD}
+								or exists (
+									select 1 from empresa_sector_service ess
+									join services sv on sv.id = ess.service_id
+									where ess.empresa_id = e.id and similarity(unaccent(sv.name), unaccent(${query})) > ${TRGM_THRESHOLD}
+								)
+								or exists (
+									select 1 from empresa_sector_service ess
+									join services sv on sv.id = ess.service_id
+									join sectors s on s.id = sv.sectors_id
+									where ess.empresa_id = e.id and similarity(unaccent(s.name), unaccent(${query})) > ${TRGM_THRESHOLD}
+								)
+							)`
+							: sql`(
+								unaccent(e.name) ilike unaccent(${'%' + query + '%'})
+								or exists (
+									select 1 from empresa_sector_service ess
+									join services sv on sv.id = ess.service_id
+									where ess.empresa_id = e.id and unaccent(sv.name) ilike unaccent(${'%' + query + '%'})
+								)
+								or exists (
+									select 1 from empresa_sector_service ess
+									join services sv on sv.id = ess.service_id
+									join sectors s on s.id = sv.sectors_id
+									where ess.empresa_id = e.id and unaccent(s.name) ilike unaccent(${'%' + query + '%'})
+								)
+							)`
+					);
 				}
 
 				if (sector) {
-					const like = `%${sector}%`;
-					conditions.push(sql`exists (
-						select 1 from empresa_sector_service ess
-						join services sv on sv.id = ess.service_id
-						join sectors s on s.id = sv.sectors_id
-						where ess.empresa_id = e.id and unaccent(s.name) ilike unaccent(${like})
-					)`);
+					conditions.push(
+						fuzzy
+							? sql`exists (
+								select 1 from empresa_sector_service ess
+								join services sv on sv.id = ess.service_id
+								join sectors s on s.id = sv.sectors_id
+								where ess.empresa_id = e.id and similarity(unaccent(s.name), unaccent(${sector})) > ${TRGM_THRESHOLD}
+							)`
+							: sql`exists (
+								select 1 from empresa_sector_service ess
+								join services sv on sv.id = ess.service_id
+								join sectors s on s.id = sv.sectors_id
+								where ess.empresa_id = e.id and unaccent(s.name) ilike unaccent(${'%' + sector + '%'})
+							)`
+					);
 				}
 
 				if (ciudad) {
-					const like = `%${ciudad}%`;
-					conditions.push(sql`(unaccent(c.city_name) ilike unaccent(${like}) or unaccent(st.state_name) ilike unaccent(${like}))`);
+					conditions.push(
+						fuzzy
+							? sql`(
+								similarity(unaccent(c.city_name), unaccent(${ciudad})) > ${TRGM_THRESHOLD}
+								or similarity(unaccent(st.state_name), unaccent(${ciudad})) > ${TRGM_THRESHOLD}
+							)`
+							: sql`(unaccent(c.city_name) ilike unaccent(${'%' + ciudad + '%'}) or unaccent(st.state_name) ilike unaccent(${'%' + ciudad + '%'}))`
+					);
 				}
 
 				if (categoria_codigo) {
@@ -150,16 +202,36 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					)`);
 				}
 
-				const where = conditions.reduce((acc, c) => sql`${acc} and ${c}`);
+				return conditions.reduce((acc, c) => sql`${acc} and ${c}`);
+			}
 
-				const rows = await sql`
+			try {
+				const exactRows = await sql`
 					${empresaSelectAndJoins(sql)}
-					where ${where}
+					where ${buildConditions(false)}
 					order by e.name
 					limit ${max}
 				`;
 
-				return { content: [{ type: 'text' as const, text: JSON.stringify(rows, null, 2) }] };
+				// El fallback difuso solo tiene sentido si el usuario dio texto libre para tolerar
+				// (categoria_codigo es un codigo exacto, no aplica). Nunca se activa si el ILIKE ya
+				// encontro algo - evita cambiar el comportamiento/orden de las busquedas que hoy
+				// funcionan bien, igual que el hibrido de `search_taxonomy` (lexico primero, semantico
+				// solo de respaldo).
+				if (exactRows.length === 0 && (query || sector || ciudad)) {
+					const fuzzyRows = await sql`
+						${empresaSelectAndJoins(sql)}
+						where ${buildConditions(true)}
+						order by e.name
+						limit ${max}
+					`;
+
+					const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const }));
+					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+				}
+
+				const tagged = exactRows.map((r) => ({ ...r, match_type: 'exact' as const }));
+				return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 			} finally {
 				await sql.end({ timeout: 1 });
 			}
@@ -192,7 +264,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				// guiones/espacios/simbolos - para que "j-07-040984-3"/"J070409843" matcheen igual.
 				const normalizedRif = rif ? rif.toUpperCase().replace(/[^A-Z0-9]/g, '') : null;
 
-				const rows = normalizedRif
+				let rows = normalizedRif
 					? await sql`
 						${empresaSelectAndJoins(sql)}
 						where e.status_id = 1 and e.rif = ${normalizedRif}
@@ -204,6 +276,17 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						order by e.name
 						limit 5
 					`;
+
+				// Mismo fallback de tolerancia a errores de tipeo que search_empresas (ver docblock de
+				// arriba) - solo aplica a busqueda por nombre, un RIF exacto no tiene "aproximado".
+				if (rows.length === 0 && nombre) {
+					rows = await sql`
+						${empresaSelectAndJoins(sql)}
+						where e.status_id = 1 and word_similarity(unaccent(${nombre}), unaccent(e.name)) > 0.35
+						order by e.name
+						limit 5
+					`;
+				}
 
 				if (rows.length === 0) {
 					return {

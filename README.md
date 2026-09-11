@@ -40,6 +40,18 @@ Worker de Cloudflare para la taxonomía CPV de `PerfilAfiliadosCPV` — ver
   `"CONSTRUCCIÓN"` sin `unaccent()`. Todo el matching de texto de este Worker usa
   `unaccent(columna) ilike unaccent(termino)` en ambos lados por este motivo.
 
+  **Tolerancia a errores de tipeo (11 sep 2026)**: `search_empresas`/`get_empresa` intentan primero
+  el match exacto/parcial de siempre; si esa pasada no devuelve nada y el usuario dio texto libre,
+  reintentan con `similarity()`/`word_similarity()` de `pg_trgm` (extensión ya instalada en este
+  proyecto de Supabase, v1.6). Cada fila trae `match_type: 'exact'|'fuzzy'` para distinguir un match
+  literal de uno aproximado. Umbral 0.35, ajustado contra datos reales (typos verificados: 0.53-1.0
+  de similitud; pares realmente distintos como "fabricantes" vs "suplidores": 0.045 — sin falsos
+  positivos). Idea tomada de [cómo Mercadona Tech construyó su
+  buscador](https://newsletter.gemba.es/p/como-construimos-nuestro-buscador), adaptada a nuestra
+  escala real (cientos de empresas, no millones de búsquedas): se usó solo la pieza de tolerancia a
+  typos vía trigramas, sin el resto de su stack de ranking con ML (no aplica a este volumen de datos
+  ni hay señales de clics para entrenar nada).
+
   Servido con `createMcpHandler` (`agents/mcp/server`, sobre `@modelcontextprotocol/server`) —
   soporta ambas eras del protocolo (SSE legacy 2025 y Streamable HTTP moderno 2026-07-28) desde el
   mismo endpoint por defecto, sin tener que elegir transporte para que conecte el nodo "MCP Client
