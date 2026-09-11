@@ -5,21 +5,40 @@ Worker de Cloudflare para la taxonomía CPV de `PerfilAfiliadosCPV` — ver
 
 ## Estado actual (11 sep 2026)
 
-**Fase MCP-1 cerrada.** Dos endpoints:
+**Fases MCP-1 y MCP-3 cerradas** (MCP-2, la integración con n8n, vive en el repo
+`PerfilAfiliadosCPV`). Dos endpoints:
 
 - **`/embed`** (Bearer `EMBED_TOKEN`) — usado por `taxonomy:generate-embeddings` de Laravel para
   poblar `taxonomy_category_embeddings` en Supabase por lote (3.483 nodos cargados).
-- **`/mcp`** (Bearer `MCP_TOKEN`) — el servidor MCP en sí, con 3 tools que no dependen de la
-  homologación empresa↔categoría (Fase 3/4 de la taxonomía, todavía sin correr):
+- **`/mcp`** (Bearer `MCP_TOKEN`) — el servidor MCP en sí, con 5 tools:
 
-  | Tool | Qué hace |
-  |---|---|
-  | `search_taxonomy` | Búsqueda híbrida (léxica + semántica) por texto libre ES/EN |
-  | `list_sectores` | Catálogo plano de sectores institucionales |
-  | `list_taxonomy_groups` | Navega el árbol CPV (sin `parent_code`: 48 Grupos; con uno: sus hijos) |
+  | Tool | Qué hace | Fuente de datos |
+  |---|---|---|
+  | `search_taxonomy` | Búsqueda híbrida (léxica + semántica) por texto libre ES/EN | `taxonomy_categories` + embeddings |
+  | `list_sectores` | Catálogo plano de sectores institucionales | `sectors` |
+  | `list_taxonomy_groups` | Navega el árbol CPV (sin `parent_code`: 48 Grupos; con uno: sus hijos) | `taxonomy_categories` |
+  | `search_empresas` | Busca empresas por texto libre/sector/ciudad/categoría CPV | `empresas` + `empresa_sector_service` + `services` + `sectors` + `cities` |
+  | `get_empresa` | Ficha completa de una empresa por RIF exacto o nombre parcial | ídem |
 
-  `search_empresas`/`get_empresa` se agregan en la Fase MCP-3, cuando `empresa_taxonomy_category`
-  tenga datos reales.
+  `search_empresas`/`get_empresa` (Fase MCP-3, 11 sep 2026) filtran solo `status_id = 1`
+  (empresas activas — resuelve la decisión pendiente #4 del plan, hoy coincide con las 406). El
+  filtro `categoria_codigo`/`tipo_oferta` está armado pero **sin datos reales todavía**:
+  `empresa_taxonomy_category` sigue en 0 filas (Fase 3/4 de homologación del proyecto de
+  taxonomía, aparte de este MCP, sin correr) — devuelve vacío, no error. El sector/servicio real
+  de cada empresa sale del pivote `empresa_sector_service` (950 filas reales), el mismo join que
+  ya usa `Empresa::distinctSectorIds()` en Laravel — no de `empresas.sector_principal_id`, que
+  está NULL en muchas filas.
+
+  **Limitación real encontrada (no es bug, es del propio dato)**: el catálogo `services` tiene
+  solo 112 entradas curadas — más angosto que el texto libre de la columna `Servicios` de la
+  vieja vista MySQL `ChatView` que usa CIRA hoy. Una búsqueda como `"soldadura"` puede devolver
+  vacío acá aunque ChatView sí tenga empresas con esa palabra en su texto libre — a tener en
+  cuenta al comparar contra el comportamiento de producción en la Fase MCP-4.
+
+  **Bug real encontrado y corregido (11 sep 2026, aplica también a `search_taxonomy`)**: a
+  diferencia de MySQL, Postgres SÍ distingue tildes en `ILIKE` — `"construccion"` no matcheaba
+  `"CONSTRUCCIÓN"` sin `unaccent()`. Todo el matching de texto de este Worker usa
+  `unaccent(columna) ilike unaccent(termino)` en ambos lados por este motivo.
 
   Servido con `createMcpHandler` (`agents/mcp/server`, sobre `@modelcontextprotocol/server`) —
   soporta ambas eras del protocolo (SSE legacy 2025 y Streamable HTTP moderno 2026-07-28) desde el
