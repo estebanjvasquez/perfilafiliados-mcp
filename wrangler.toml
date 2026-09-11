@@ -1,6 +1,15 @@
 name = "perfilafiliados-mcp"
 main = "src/index.ts"
 compatibility_date = "2026-09-11"
+# postgres.js (cliente de Hyperdrive) necesita sockets TCP crudos, expuestos via nodejs_compat.
+compatibility_flags = ["nodejs_compat"]
 
 [ai]
 binding = "AI"
+
+# Acceso directo a Postgres/Supabase (taxonomía CPV) para las tools MCP (search_taxonomy,
+# list_sectores, list_taxonomy_groups). Hyperdrive pooleatra conexiones desde el edge - sin esto,
+# Workers no sostiene bien TCP directo contra el pooler de Supabase en cada invocación.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "f16a1ab0a9514504b80bd14138699d4c"

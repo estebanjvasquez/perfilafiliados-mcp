@@ -10,5 +10,10 @@
     "@cloudflare/workers-types": "^5.20260910.1",
     "typescript": "^5.7.2",
     "wrangler": "^4.90.1"
+  },
+  "dependencies": {
+    "agents": "^0.23.0",
+    "postgres": "^3.4.9",
+    "zod": "^4.6.2"
   }
 }

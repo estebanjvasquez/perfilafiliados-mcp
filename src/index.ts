@@ -1,21 +1,32 @@
 /**
  * perfilafiliados-mcp — Worker de infraestructura para la taxonomia CPV de PerfilAfiliadosCPV.
  *
- * Fase MCP-1 (ver docs/taxonomia/plan_mcp_cira.md del repo PerfilAfiliadosCPV): arranca como un
- * endpoint de embeddings puro (/embed), protegido con un Bearer token propio (EMBED_TOKEN,
- * secret del Worker, nunca en este repo) - lo usa el comando `taxonomy:generate-embeddings` de
- * Laravel para poblar `taxonomy_category_embeddings` en Supabase por lote. Las tools MCP en si
- * (search_taxonomy, list_sectores, list_taxonomy_groups) se agregan despues, sobre este mismo
- * Worker - no es un servicio descartable, es el arranque real de la pieza de infraestructura.
+ * Fase MCP-1 (ver docs/taxonomia/plan_mcp_cira.md del repo PerfilAfiliadosCPV):
  *
- * Modelo: @cf/baai/bge-m3 (multilingue, ES/EN sin distincion - clave porque la taxonomia esta en
- * los dos idiomas). Dimension real del vector: NO asumida, se documenta abajo una vez verificada
- * empiricamente contra el modelo real (ver comentario junto a EmbedResponse).
+ * - `/embed` — endpoint interno (Bearer EMBED_TOKEN) usado por `taxonomy:generate-embeddings` de
+ *   Laravel para poblar `taxonomy_category_embeddings` en Supabase por lote.
+ * - `/mcp` — el servidor MCP en si (Bearer MCP_TOKEN), con las tools que no dependen de la
+ *   homologacion empresa<->categoria (Fase 3/4, todavia sin correr): `search_taxonomy`,
+ *   `list_sectores`, `list_taxonomy_groups`. Ver src/taxonomy-tools.ts.
+ *   `createMcpHandler` (paquete `agents/mcp/server`, que envuelve `@modelcontextprotocol/server`)
+ *   sirve ambas eras del protocolo (legacy SSE 2025 y moderno Streamable HTTP 2026-07-28) desde el
+ *   mismo endpoint por defecto (`legacy: 'stateless'`) - no hace falta elegir un transporte fijo
+ *   para que el nodo "MCP Client Tool" de n8n conecte, sea cual sea la opcion que tenga elegida.
+ *
+ * Modelo de embeddings: @cf/baai/bge-m3 (multilingue, ES/EN sin distincion - clave porque la
+ * taxonomia esta en los dos idiomas). Dimension real del vector, verificada empiricamente contra
+ * el modelo real (no asumida de la documentacion de Cloudflare, que no la especifica): 1024.
  */
+
+import { createMcpHandler } from 'agents/mcp/server';
+import { McpServer } from '@modelcontextprotocol/server';
+import { registerTaxonomyTools } from './taxonomy-tools';
 
 export interface Env {
 	AI: Ai;
+	HYPERDRIVE: Hyperdrive;
 	EMBED_TOKEN: string;
+	MCP_TOKEN: string;
 }
 
 interface EmbedRequestBody {
@@ -23,7 +34,7 @@ interface EmbedRequestBody {
 }
 
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
 		if (url.pathname === '/' && request.method === 'GET') {
@@ -34,9 +45,30 @@ export default {
 			return handleEmbed(request, env);
 		}
 
+		if (url.pathname === '/mcp') {
+			return handleMcp(request, env, ctx);
+		}
+
 		return new Response('Not found', { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
+
+async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const auth = request.headers.get('Authorization') ?? '';
+
+	if (auth !== `Bearer ${env.MCP_TOKEN}`) {
+		return Response.json({ error: 'unauthorized' }, { status: 401 });
+	}
+
+	const handler = createMcpHandler(() => {
+		const server = new McpServer({ name: 'perfilafiliados-taxonomy-mcp', version: '0.1.0' });
+		registerTaxonomyTools(server, env);
+
+		return server;
+	});
+
+	return handler.fetch(request);
+}
 
 async function handleEmbed(request: Request, env: Env): Promise<Response> {
 	const auth = request.headers.get('Authorization') ?? '';
