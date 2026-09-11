@@ -6,8 +6,8 @@ import { getSql } from './db';
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
  * `get_empresa`, contra las tablas reales de Postgres/Supabase que ya usa el panel Filament
- * (`empresas`, `empresa_sector_service`, `services`, `sectors`, `cities`, `countries`) - NO contra
- * la vista MySQL `ChatView` vieja que usa hoy CIRA en producción.
+ * (`empresas`, `empresa_sector_service`, `services`, `sectors`, `cities`, `states`, `countries`) -
+ * NO contra la vista MySQL `ChatView` vieja que usa hoy CIRA en producción.
  *
  * Verificado contra Supabase real (11 sep 2026) antes de escribir esto:
  * - `empresa_taxonomy_category` (homologación empresa<->categoría CPV, Fase 3/4 del plan de
@@ -23,10 +23,44 @@ import { getSql } from './db';
  *   `EmpresaResource.php`, columna "Activo", TernaryFilter) - decisión #4 pendiente en la sección 9
  *   del plan ("¿todas las 406, o solo las activas?"): se resuelve acá exponiendo SOLO
  *   `status_id = 1` (hoy coincide con las 406, pero es la semántica correcta a futuro).
+ * - `cities.states_id` -> `states.state_name` da el "estado" venezolano (ej. ZULIA) que ChatView
+ *   exponía como columna separada (`state`) - el parámetro `ciudad` matchea contra AMBOS
+ *   (ciudad o estado) para no complicar el schema del tool con un parámetro más.
  * - Deliberadamente NO se expone contacto personal (tabla `contacts`/`principalContact()`) - esta
  *   tool es un directorio público equivalente a lo que ya expone `ChatView` hoy (datos a nivel de
  *   empresa: teléfono, sitio web, dirección), no datos personales de la persona de contacto.
+ *
+ * Todo el matching de texto usa `unaccent(columna) ilike unaccent(termino)` en ambos lados -
+ * Postgres, a diferencia de MySQL, distingue tildes en ILIKE (bug real encontrado y corregido acá
+ * y en `search_taxonomy` de Fase MCP-1 - ver ese archivo).
  */
+
+/** Columnas + joins compartidos entre las 3 queries de este archivo - evita repetir el mismo SQL 3 veces. */
+function empresaSelectAndJoins(sql: ReturnType<typeof getSql>) {
+	return sql`
+		select
+			e.id, e.rif, e.name, e.phone, e.website, e.street, e.ano_fund,
+			c.city_name, st.state_name, co.country_name,
+			(
+				select string_agg(distinct s.name, ', ' order by s.name)
+				from empresa_sector_service ess
+				join services sv on sv.id = ess.service_id
+				join sectors s on s.id = sv.sectors_id
+				where ess.empresa_id = e.id
+			) as sectores,
+			(
+				select string_agg(distinct sv.name, ', ' order by sv.name)
+				from empresa_sector_service ess
+				join services sv on sv.id = ess.service_id
+				where ess.empresa_id = e.id
+			) as servicios
+		from empresas e
+		left join cities c on c.id = e.city_id
+		left join states st on st.id = c.states_id
+		left join countries co on co.id = c.country_id
+	`;
+}
+
 export function registerEmpresaTools(server: McpServer, env: Env): void {
 	server.registerTool(
 		'search_empresas',
@@ -34,13 +68,14 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			description:
 				'Busca empresas afiliadas a la Cámara Petrolera de Venezuela. Requiere al menos un filtro ' +
 				'(query, sector, ciudad o categoria_codigo) - no permite listar todas las empresas sin filtrar. ' +
-				'"query" busca por nombre de empresa, servicio o sector en texto libre. "categoria_codigo" filtra ' +
-				'por la taxonomía CPV nueva, pero esa homologación todavía no tiene datos cargados (Fase 3/4 del ' +
-				'proyecto de taxonomía), así que hoy puede no devolver nada - usar query/sector/ciudad mientras tanto.',
+				'"query" busca por nombre de empresa, servicio o sector en texto libre. "ciudad" matchea ciudad o ' +
+				'estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva, pero esa homologación ' +
+				'todavía no tiene datos cargados (Fase 3/4 del proyecto de taxonomía), así que hoy puede no ' +
+				'devolver nada - usar query/sector/ciudad mientras tanto.',
 			inputSchema: {
 				query: z.string().min(2).optional().describe('Texto libre: nombre de empresa, servicio o sector'),
 				sector: z.string().optional().describe('Nombre (parcial) de uno de los 8 sectores institucionales, ej. "construccion"'),
-				ciudad: z.string().optional().describe('Nombre (parcial) de ciudad, ej. "maracaibo"'),
+				ciudad: z.string().optional().describe('Nombre (parcial) de ciudad o estado, ej. "maracaibo" o "zulia"'),
 				categoria_codigo: z
 					.string()
 					.optional()
@@ -101,7 +136,8 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				}
 
 				if (ciudad) {
-					conditions.push(sql`unaccent(c.city_name) ilike unaccent(${'%' + ciudad + '%'})`);
+					const like = `%${ciudad}%`;
+					conditions.push(sql`(unaccent(c.city_name) ilike unaccent(${like}) or unaccent(st.state_name) ilike unaccent(${like}))`);
 				}
 
 				if (categoria_codigo) {
@@ -117,25 +153,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				const where = conditions.reduce((acc, c) => sql`${acc} and ${c}`);
 
 				const rows = await sql`
-					select
-						e.id, e.rif, e.name, e.phone, e.website, e.street, e.ano_fund,
-						c.city_name, co.country_name,
-						(
-							select string_agg(distinct s.name, ', ' order by s.name)
-							from empresa_sector_service ess
-							join services sv on sv.id = ess.service_id
-							join sectors s on s.id = sv.sectors_id
-							where ess.empresa_id = e.id
-						) as sectores,
-						(
-							select string_agg(distinct sv.name, ', ' order by sv.name)
-							from empresa_sector_service ess
-							join services sv on sv.id = ess.service_id
-							where ess.empresa_id = e.id
-						) as servicios
-					from empresas e
-					left join cities c on c.id = e.city_id
-					left join countries co on co.id = c.country_id
+					${empresaSelectAndJoins(sql)}
 					where ${where}
 					order by e.name
 					limit ${max}
@@ -176,42 +194,12 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 
 				const rows = normalizedRif
 					? await sql`
-						select
-							e.id, e.rif, e.name, e.phone, e.website, e.street, e.ano_fund,
-							c.city_name, co.country_name,
-							(
-								select string_agg(distinct s.name, ', ' order by s.name)
-								from empresa_sector_service ess join services sv on sv.id = ess.service_id
-								join sectors s on s.id = sv.sectors_id where ess.empresa_id = e.id
-							) as sectores,
-							(
-								select string_agg(distinct sv.name, ', ' order by sv.name)
-								from empresa_sector_service ess join services sv on sv.id = ess.service_id
-								where ess.empresa_id = e.id
-							) as servicios
-						from empresas e
-						left join cities c on c.id = e.city_id
-						left join countries co on co.id = c.country_id
+						${empresaSelectAndJoins(sql)}
 						where e.status_id = 1 and e.rif = ${normalizedRif}
 						limit 1
 					`
 					: await sql`
-						select
-							e.id, e.rif, e.name, e.phone, e.website, e.street, e.ano_fund,
-							c.city_name, co.country_name,
-							(
-								select string_agg(distinct s.name, ', ' order by s.name)
-								from empresa_sector_service ess join services sv on sv.id = ess.service_id
-								join sectors s on s.id = sv.sectors_id where ess.empresa_id = e.id
-							) as sectores,
-							(
-								select string_agg(distinct sv.name, ', ' order by sv.name)
-								from empresa_sector_service ess join services sv on sv.id = ess.service_id
-								where ess.empresa_id = e.id
-							) as servicios
-						from empresas e
-						left join cities c on c.id = e.city_id
-						left join countries co on co.id = c.country_id
+						${empresaSelectAndJoins(sql)}
 						where e.status_id = 1 and unaccent(e.name) ilike unaccent(${'%' + nombre + '%'})
 						order by e.name
 						limit 5
