@@ -173,8 +173,8 @@ export function registerTaxonomyTools(server: McpServer, env: Env): void {
 	);
 }
 
-/** Misma forma de respuesta verificada empíricamente en handleEmbed() de index.ts. */
-function extractEmbeddingVector(result: unknown): string | null {
+/** Misma forma de respuesta verificada empíricamente en handleEmbed() de index.ts. Exportada: la reusa empresa-tools.ts para el fallback semántico de search_empresas. */
+export function extractEmbeddingVector(result: unknown): string | null {
 	const data = (result as any)?.data ?? (result as any)?.response?.data;
 
 	if (!Array.isArray(data) || !Array.isArray(data[0])) {

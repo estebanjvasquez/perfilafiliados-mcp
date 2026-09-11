@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
+import { extractEmbeddingVector } from './taxonomy-tools';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -34,20 +35,57 @@ import { getSql } from './db';
  * Postgres, a diferencia de MySQL, distingue tildes en ILIKE (bug real encontrado y corregido acá
  * y en `search_taxonomy` de Fase MCP-1 - ver ese archivo).
  *
- * Fallback de tolerancia a errores de tipeo (11 sep 2026, inspirado en el approach hibrido de
- * Mercadona Tech - https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, adaptado a
- * nuestra escala real de 406 empresas/112 servicios, muy lejos de sus millones de busquedas):
- * `search_empresas`/`get_empresa` intentan primero el match exacto/parcial de siempre (ILIKE). Si
- * esa pasada no devuelve NADA y el usuario dio texto libre (query/sector/ciudad/nombre), se repite
- * la misma busqueda con `similarity()`/`word_similarity()` de la extension `pg_trgm` (YA estaba
- * instalada en este proyecto de Supabase, v1.6 - no fue necesario habilitarla) - tolera
- * transposiciones/letras de mas o de menos ("consturccion" -> CONSTRUCCIÓN) sin necesidad de un
- * modelo de embeddings para esto (eso ya lo resuelve `search_taxonomy` para sinonimos/conceptos,
- * que es un problema distinto al de errores de tipeo). No se creo indice GIN de trigramas: con
- * este volumen de filas un sequential scan es instantaneo, un indice seria complejidad sin
- * beneficio medible. Cada fila devuelta en modo fallback trae `match_type: 'fuzzy'` (las del modo
- * normal traen `match_type: 'exact'`) para que quien consuma la tool pueda distinguir un match
- * literal de uno aproximado - mismo patron que `match_type` en `search_taxonomy`.
+ * `search_empresas` es HIBRIDO en 3 niveles, cada uno solo se activa si el anterior no devolvio
+ * NADA (nunca cambia el resultado de una busqueda que ya funciona - mismo principio que el hibrido
+ * lexico+semantico de `search_taxonomy`, Fase MCP-1):
+ *
+ * 1. EXACTO - `unaccent(columna) ilike unaccent(termino)` de siempre. `match_type: 'exact'`.
+ *
+ * 2. DIFUSO (11 sep 2026, `pg_trgm`, YA estaba instalado en este proyecto de Supabase v1.6 - no
+ *    hubo que habilitarlo) - tolera errores de tipeo: transposiciones/letras de mas o de menos
+ *    ("consturccion" -> CONSTRUCCIÓN). Usa `word_similarity()` (no `similarity()` a secas) para
+ *    comparar el termino del usuario contra nombres de empresa/servicio/sector, que son frases
+ *    LARGAS - `similarity()` normaliza por el total de trigramas de ambos strings y castiga
+ *    injustamente a un termino corto contra una frase larga (bug real encontrado y corregido acá
+ *    mismo: la primera version de este fallback usaba `similarity()` para servicios/sectores y
+ *    NO detectaba "soldadura" -> "MATERIALES, EQUIPOS Y ACCESORIOS PARA SOLDAR" pese a ser la
+ *    misma raiz). Umbral 0.5 (subido de un 0.35 inicial): calibrado para que seguir aceptando
+ *    todos los typos reales verificados (0.53-1.0) pero RECHAZAR falsos positivos por coincidencia
+ *    de trigramas sin relacion real - ej. "grua" contra "CEMENTACIÓN Y EMPAQUE CON GRAVA" da 0.4,
+ *    una coincidencia de letras sin ninguna relacion semantica (grava != grua). `match_type: 'fuzzy'`.
+ *    No se creo indice GIN de trigramas: con este volumen de filas (cientos, no millones) un
+ *    sequential scan es instantaneo, un indice seria complejidad sin beneficio medible.
+ *
+ *    IMPORTANTE - el fallback difuso de `query` compara SOLO contra servicio/sector, NO contra
+ *    `e.name` (nombre de empresa). Se probo y se saco a proposito: con 406 nombres de empresa
+ *    reales, un termino corto de 4-5 letras choca por coincidencia con MUCHOS nombres sin relacion
+ *    (ej. "grua" contra "GRUPO PROMARGON, C.A." da 0.6 - EL MISMO score que el match genuino
+ *    "soldadura"->"SOLDAR" - no hay forma de separarlos con un solo umbral). El catalogo de
+ *    servicios (112 filas, frases descriptivas) no tiene ese problema. Buscar una empresa por
+ *    nombre con errores de tipeo es lo que ya hace `get_empresa` (comparacion 1-a-1 mas acotada,
+ *    ahi si sigue aplicando word_similarity contra `e.name`).
+ *
+ * 3. SEMANTICO (11 sep 2026, inspirado en el approach hibrido de Mercadona Tech -
+ *    https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, adaptado a nuestra escala
+ *    real de 406 empresas/112 servicios, muy lejos de sus millones de busquedas - se tomo SOLO la
+ *    idea de hibrido lexico+semantico, no su stack de ranking con ML que no aplica acá) - solo
+ *    para el parametro `query` (`sector`/`ciudad` son vocabulario cerrado/geografico, no se
+ *    benefician de esto). Cuando ni el match exacto ni el difuso encuentran nada, embebe el
+ *    `query` con el mismo modelo `@cf/baai/bge-m3` que ya usa `search_taxonomy` y lo compara
+ *    contra `service_embeddings` (embedding de cada uno de los 112 servicios del catalogo +
+ *    su sector, ver migracion `2026_09_11_150000_create_service_embeddings_table` y comando
+ *    `empresas:generate-service-embeddings` en PerfilAfiliadosCPV) - encuentra el SERVICIO
+ *    conceptualmente mas cercano aunque no comparta ninguna raiz literal (ej. "valvulas" no
+ *    aparece en ningun `services.name`, pero cae semanticamente cerca de "TUBERÍAS, TUBOS Y
+ *    CONEXIONES"), y devuelve las empresas vinculadas a ese servicio. Umbral de distancia coseno
+ *    0.60, calibrado contra casos reales (matches genuinos "soldadura"/"valvulas"/consultas en
+ *    lenguaje natural: 0.50-0.57; no-matches genuinos como "grua" - el catalogo simplemente no
+ *    tiene equipo de izaje - o "clases de matematicas": 0.63+). Por que a nivel de SERVICIO y no
+ *    de EMPRESA: el contenido semantico util esta en la descripcion del servicio, no en el nombre
+ *    propio de la empresa que lo presta (ver docblock de la migracion para el detalle). No resuelve
+ *    "grua": es un hueco real del catalogo (ningun servicio real es sobre equipos de izamiento),
+ *    no un problema de busqueda - documentado tambien en el calibracion original de Fase MCP-2.
+ *    `match_type: 'semantic'`.
  */
 
 /** Columnas + joins compartidos entre las 3 queries de este archivo - evita repetir el mismo SQL 3 veces. */
@@ -119,11 +157,11 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			const max = limit ?? 20;
 			const sql = getSql(env);
 
-			// Umbral de similitud de pg_trgm - 0.35 es mas permisivo que el default de la extension
-			// (0.3 para similarity(), pero word_similarity() suele pedir un poco mas para no generar
-			// falsos positivos con nombres de empresa largos). Ajustado a mano contra los sectores/
-			// servicios/empresas reales de este proyecto, no es un valor de libreria.
-			const TRGM_THRESHOLD = 0.35;
+			// Umbral de pg_trgm - ver docblock de arriba para la calibracion (0.5, subido desde un
+			// 0.35 inicial que dejaba pasar falsos positivos tipo "grua"/"grava").
+			const TRGM_THRESHOLD = 0.5;
+			// Umbral de distancia coseno para el fallback semantico - ver docblock de arriba.
+			const SEMANTIC_DISTANCE_THRESHOLD = 0.6;
 
 			/** Arma el WHERE - `fuzzy=false` es el ILIKE exacto de siempre; `fuzzy=true` es el fallback por similitud. */
 			function buildConditions(fuzzy: boolean) {
@@ -133,17 +171,16 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					conditions.push(
 						fuzzy
 							? sql`(
-								word_similarity(unaccent(${query}), unaccent(e.name)) > ${TRGM_THRESHOLD}
-								or exists (
+								exists (
 									select 1 from empresa_sector_service ess
 									join services sv on sv.id = ess.service_id
-									where ess.empresa_id = e.id and similarity(unaccent(sv.name), unaccent(${query})) > ${TRGM_THRESHOLD}
+									where ess.empresa_id = e.id and word_similarity(unaccent(${query}), unaccent(sv.name)) > ${TRGM_THRESHOLD}
 								)
 								or exists (
 									select 1 from empresa_sector_service ess
 									join services sv on sv.id = ess.service_id
 									join sectors s on s.id = sv.sectors_id
-									where ess.empresa_id = e.id and similarity(unaccent(s.name), unaccent(${query})) > ${TRGM_THRESHOLD}
+									where ess.empresa_id = e.id and word_similarity(unaccent(${query}), unaccent(s.name)) > ${TRGM_THRESHOLD}
 								)
 							)`
 							: sql`(
@@ -213,12 +250,16 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					limit ${max}
 				`;
 
-				// El fallback difuso solo tiene sentido si el usuario dio texto libre para tolerar
-				// (categoria_codigo es un codigo exacto, no aplica). Nunca se activa si el ILIKE ya
-				// encontro algo - evita cambiar el comportamiento/orden de las busquedas que hoy
-				// funcionan bien, igual que el hibrido de `search_taxonomy` (lexico primero, semantico
-				// solo de respaldo).
-				if (exactRows.length === 0 && (query || sector || ciudad)) {
+				if (exactRows.length > 0) {
+					const tagged = exactRows.map((r) => ({ ...r, match_type: 'exact' as const }));
+					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+				}
+
+				// Nivel 2 (difuso) y 3 (semantico) solo tienen sentido si el usuario dio texto libre
+				// para tolerar (categoria_codigo es un codigo exacto, no aplica a ninguno de los 2).
+				// Nunca se activan si el ILIKE ya encontro algo - mismo principio que el hibrido de
+				// `search_taxonomy` (lexico primero, semantico solo de respaldo).
+				if (query || sector || ciudad) {
 					const fuzzyRows = await sql`
 						${empresaSelectAndJoins(sql)}
 						where ${buildConditions(true)}
@@ -226,12 +267,55 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						limit ${max}
 					`;
 
-					const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const }));
-					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+					if (fuzzyRows.length > 0) {
+						const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const }));
+						return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+					}
 				}
 
-				const tagged = exactRows.map((r) => ({ ...r, match_type: 'exact' as const }));
-				return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+				// Nivel 3: semantico, solo para `query` (sector/ciudad son vocabulario cerrado/
+				// geografico, no texto conceptual libre) - ver docblock de arriba para el diseno.
+				if (query) {
+					const embeddingResult = await env.AI.run('@cf/baai/bge-m3', { text: [query] });
+					const vector = extractEmbeddingVector(embeddingResult);
+
+					if (vector) {
+						// Los 3 servicios MAS cercanos, no "todos los que pasen el umbral" - para una
+						// consulta larga en lenguaje natural, decenas de los 112 servicios pueden caer
+						// por debajo del umbral sin ser realmente relevantes (la oracion completa se
+						// embebe "generica" y queda cerca de casi todo) - acotar a un top-N fijo evita
+						// que el resultado termine siendo "casi todo el directorio". El umbral igual se
+						// aplica: si ni el MEJOR match esta por debajo, no hay servicios candidatos.
+						const matchedServices = await sql<{ service_id: number }[]>`
+							select sv.id as service_id
+							from services sv
+							join service_embeddings se on se.service_id = sv.id
+							where (se.embedding <=> ${vector}::vector) < ${SEMANTIC_DISTANCE_THRESHOLD}
+							order by (se.embedding <=> ${vector}::vector) asc
+							limit 3
+						`;
+
+						if (matchedServices.length > 0) {
+							const serviceIds = matchedServices.map((s) => s.service_id);
+							const semanticRows = await sql`
+								${empresaSelectAndJoins(sql)}
+								where e.status_id = 1 and exists (
+									select 1 from empresa_sector_service ess
+									where ess.empresa_id = e.id and ess.service_id in ${sql(serviceIds)}
+								)
+								order by e.name
+								limit ${max}
+							`;
+
+							if (semanticRows.length > 0) {
+								const tagged = semanticRows.map((r) => ({ ...r, match_type: 'semantic' as const }));
+								return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+							}
+						}
+					}
+				}
+
+				return { content: [{ type: 'text' as const, text: JSON.stringify([], null, 2) }] };
 			} finally {
 				await sql.end({ timeout: 1 });
 			}
@@ -282,7 +366,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				if (rows.length === 0 && nombre) {
 					rows = await sql`
 						${empresaSelectAndJoins(sql)}
-						where e.status_id = 1 and word_similarity(unaccent(${nombre}), unaccent(e.name)) > 0.35
+						where e.status_id = 1 and word_similarity(unaccent(${nombre}), unaccent(e.name)) > 0.5
 						order by e.name
 						limit 5
 					`;

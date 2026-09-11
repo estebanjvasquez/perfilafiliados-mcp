@@ -40,17 +40,27 @@ Worker de Cloudflare para la taxonomía CPV de `PerfilAfiliadosCPV` — ver
   `"CONSTRUCCIÓN"` sin `unaccent()`. Todo el matching de texto de este Worker usa
   `unaccent(columna) ilike unaccent(termino)` en ambos lados por este motivo.
 
-  **Tolerancia a errores de tipeo (11 sep 2026)**: `search_empresas`/`get_empresa` intentan primero
-  el match exacto/parcial de siempre; si esa pasada no devuelve nada y el usuario dio texto libre,
-  reintentan con `similarity()`/`word_similarity()` de `pg_trgm` (extensión ya instalada en este
-  proyecto de Supabase, v1.6). Cada fila trae `match_type: 'exact'|'fuzzy'` para distinguir un match
-  literal de uno aproximado. Umbral 0.35, ajustado contra datos reales (typos verificados: 0.53-1.0
-  de similitud; pares realmente distintos como "fabricantes" vs "suplidores": 0.045 — sin falsos
-  positivos). Idea tomada de [cómo Mercadona Tech construyó su
-  buscador](https://newsletter.gemba.es/p/como-construimos-nuestro-buscador), adaptada a nuestra
-  escala real (cientos de empresas, no millones de búsquedas): se usó solo la pieza de tolerancia a
-  typos vía trigramas, sin el resto de su stack de ranking con ML (no aplica a este volumen de datos
-  ni hay señales de clics para entrenar nada).
+  **Búsqueda híbrida en 3 niveles (11 sep 2026, `search_empresas`)** — cada nivel solo se activa si
+  el anterior no devolvió nada, idea tomada de [cómo Mercadona Tech construyó su
+  buscador](https://newsletter.gemba.es/p/como-construimos-nuestro-buscador) pero adaptada a
+  nuestra escala real (cientos de empresas, no millones de búsquedas — se tomó solo la idea de
+  híbrido léxico+semántico, no su stack de ranking con ML):
+  1. **Exacto** — `unaccent(columna) ilike unaccent(término)` de siempre.
+  2. **Difuso** (`pg_trgm`, ya instalado en este proyecto de Supabase, v1.6) — tolera errores de
+     tipeo (`"consturccion"` → CONSTRUCCIÓN) vía `word_similarity()` contra servicio/sector (NO
+     contra nombre de empresa — con 406 nombres reales, un término corto choca por coincidencia con
+     nombres sin relación, ej. "grua" vs "GRUPO PROMARGON" da el mismo score que un match genuino).
+     Umbral 0.5, calibrado contra datos reales.
+  3. **Semántico** (mismo modelo `@cf/baai/bge-m3` que `search_taxonomy`, nueva tabla
+     `service_embeddings` — un embedding por cada uno de los 112 servicios del catálogo + su
+     sector) — encuentra el servicio conceptualmente más cercano aunque no comparta ninguna raíz
+     literal (`"valvulas"` → cae cerca de "TUBERÍAS, TUBOS Y CONEXIONES"). Acotado a los 3 servicios
+     MÁS cercanos (no "todos los que pasen el umbral" — una consulta larga en lenguaje natural puede
+     caer cerca de 20+ de los 112 servicios sin ser relevante). Umbral de distancia coseno 0.60. No
+     resuelve `"grua"` (equipos de izamiento): es un hueco real del catálogo, ningún servicio real
+     cubre eso — ni el trigrama ni el embedding deberían inventar una respuesta ahí, y no la dan.
+
+  Cada fila devuelta trae `match_type: 'exact'|'fuzzy'|'semantic'` para distinguir el tipo de match.
 
   Servido con `createMcpHandler` (`agents/mcp/server`, sobre `@modelcontextprotocol/server`) —
   soporta ambas eras del protocolo (SSE legacy 2025 y Streamable HTTP moderno 2026-07-28) desde el
