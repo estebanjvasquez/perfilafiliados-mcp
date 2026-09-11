@@ -17,6 +17,12 @@ import { getSql } from './db';
  * conocida) y complementa con semántico (para consultas conceptuales en lenguaje natural, donde sí
  * funciona muy bien — verificado con "necesito comprar válvulas para el cabezal de un pozo
  * petrolero" → top resultados todos de la familia Válvulas/Valves).
+ *
+ * Bug real encontrado durante la Fase MCP-3 (11 sep 2026), corregido acá también: a diferencia de
+ * MySQL (collation por defecto insensible a tildes), Postgres SÍ distingue tildes en ILIKE - un
+ * ILIKE sin `unaccent()` no matchea "construccion" contra "CONSTRUCCIÓN" en la base real. Todo el
+ * matching léxico de esta tool usa `unaccent(columna) ilike unaccent(termino)` en ambos lados por
+ * este motivo (la extensión `unaccent` ya está habilitada en este proyecto de Supabase).
  */
 export function registerTaxonomyTools(server: McpServer, env: Env): void {
 	server.registerTool(
@@ -45,10 +51,10 @@ export function registerTaxonomyTools(server: McpServer, env: Env): void {
 					from taxonomy_categories tc
 					left join taxonomy_category_translations tt_es on tt_es.category_id = tc.id and tt_es.locale = 'es'
 					left join taxonomy_category_translations tt_en on tt_en.category_id = tc.id and tt_en.locale = 'en'
-					left join taxonomy_category_synonyms s on s.category_id = tc.id and s.term ilike ${'%' + query + '%'}
-					where tt_es.name ilike ${'%' + query + '%'}
-						or tt_en.name ilike ${'%' + query + '%'}
-						or s.term ilike ${'%' + query + '%'}
+					left join taxonomy_category_synonyms s on s.category_id = tc.id and unaccent(s.term) ilike unaccent(${'%' + query + '%'})
+					where unaccent(tt_es.name) ilike unaccent(${'%' + query + '%'})
+						or unaccent(tt_en.name) ilike unaccent(${'%' + query + '%'})
+						or unaccent(s.term) ilike unaccent(${'%' + query + '%'})
 					limit ${max}
 				`;
 

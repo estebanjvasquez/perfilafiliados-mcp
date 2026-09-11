@@ -5,9 +5,10 @@
  *
  * - `/embed` — endpoint interno (Bearer EMBED_TOKEN) usado por `taxonomy:generate-embeddings` de
  *   Laravel para poblar `taxonomy_category_embeddings` en Supabase por lote.
- * - `/mcp` — el servidor MCP en si (Bearer MCP_TOKEN), con las tools que no dependen de la
- *   homologacion empresa<->categoria (Fase 3/4, todavia sin correr): `search_taxonomy`,
- *   `list_sectores`, `list_taxonomy_groups`. Ver src/taxonomy-tools.ts.
+ * - `/mcp` — el servidor MCP en si (Bearer MCP_TOKEN). Fase MCP-1: `search_taxonomy`,
+ *   `list_sectores`, `list_taxonomy_groups` (src/taxonomy-tools.ts). Fase MCP-3: `search_empresas`,
+ *   `get_empresa` (src/empresa-tools.ts), contra las tablas reales de empresas en Postgres/Supabase
+ *   (no la vista MySQL `ChatView` que usa CIRA en produccion hoy).
  *   `createMcpHandler` (paquete `agents/mcp/server`, que envuelve `@modelcontextprotocol/server`)
  *   sirve ambas eras del protocolo (legacy SSE 2025 y moderno Streamable HTTP 2026-07-28) desde el
  *   mismo endpoint por defecto (`legacy: 'stateless'`) - no hace falta elegir un transporte fijo
@@ -21,6 +22,7 @@
 import { createMcpHandler } from 'agents/mcp/server';
 import { McpServer } from '@modelcontextprotocol/server';
 import { registerTaxonomyTools } from './taxonomy-tools';
+import { registerEmpresaTools } from './empresa-tools';
 
 export interface Env {
 	AI: Ai;
@@ -63,6 +65,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
 	const handler = createMcpHandler(() => {
 		const server = new McpServer({ name: 'perfilafiliados-taxonomy-mcp', version: '0.1.0' });
 		registerTaxonomyTools(server, env);
+		registerEmpresaTools(server, env);
 
 		return server;
 	});
