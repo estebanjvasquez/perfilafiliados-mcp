@@ -1,0 +1,6 @@
+name = "perfilafiliados-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-09-11"
+
+[ai]
+binding = "AI"
