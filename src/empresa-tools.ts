@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
-import { extractEmbeddingVector } from './taxonomy-tools';
+import { extractEmbeddingVectors } from './taxonomy-tools';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -65,28 +65,181 @@ import { extractEmbeddingVector } from './taxonomy-tools';
  *    nombre con errores de tipeo es lo que ya hace `get_empresa` (comparacion 1-a-1 mas acotada,
  *    ahi si sigue aplicando word_similarity contra `e.name`).
  *
- * 3. SEMANTICO (11 sep 2026, inspirado en el approach hibrido de Mercadona Tech -
- *    https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, adaptado a nuestra escala
- *    real de 406 empresas/112 servicios, muy lejos de sus millones de busquedas - se tomo SOLO la
- *    idea de hibrido lexico+semantico, no su stack de ranking con ML que no aplica acá) - solo
- *    para el parametro `query` (`sector`/`ciudad` son vocabulario cerrado/geografico, no se
- *    benefician de esto). Cuando ni el match exacto ni el difuso encuentran nada, embebe el
- *    `query` con el mismo modelo `@cf/baai/bge-m3` que ya usa `search_taxonomy` y lo compara
- *    contra `service_embeddings` (embedding de cada uno de los 112 servicios del catalogo +
- *    su sector, ver migracion `2026_09_11_150000_create_service_embeddings_table` y comando
- *    `empresas:generate-service-embeddings` en PerfilAfiliadosCPV) - encuentra el SERVICIO
- *    conceptualmente mas cercano aunque no comparta ninguna raiz literal (ej. "valvulas" no
- *    aparece en ningun `services.name`, pero cae semanticamente cerca de "TUBERÍAS, TUBOS Y
- *    CONEXIONES"), y devuelve las empresas vinculadas a ese servicio. Umbral de distancia coseno
- *    0.60, calibrado contra casos reales (matches genuinos "soldadura"/"valvulas"/consultas en
- *    lenguaje natural: 0.50-0.57; no-matches genuinos como "grua" - el catalogo simplemente no
- *    tiene equipo de izaje - o "clases de matematicas": 0.63+). Por que a nivel de SERVICIO y no
- *    de EMPRESA: el contenido semantico util esta en la descripcion del servicio, no en el nombre
- *    propio de la empresa que lo presta (ver docblock de la migracion para el detalle). No resuelve
- *    "grua": es un hueco real del catalogo (ningun servicio real es sobre equipos de izamiento),
- *    no un problema de busqueda - documentado tambien en el calibracion original de Fase MCP-2.
- *    `match_type: 'semantic'`.
+ * 3. SEMANTICO (rediseñado 12 sep 2026, Fase MCP-4.3 - la v1 del 11 sep embebia el `query`
+ *    COMPLETO como un solo vector; ver "Bug de dilucion semantica" mas abajo para por que se
+ *    reemplazo) - inspirado en el approach hibrido de Mercadona Tech
+ *    (https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, se tomo SOLO la idea de
+ *    hibrido lexico+semantico adaptada a nuestra escala real de cientos de empresas, no su stack
+ *    de ranking con ML). Solo para el parametro `query` (`sector`/`ciudad` son vocabulario
+ *    cerrado/geografico, no texto conceptual libre). 3 pasos:
+ *
+ *    a) DESCOMPONER `query` en frases candidatas cortas (`extractCandidatePhrases`) - palabras
+ *       significativas sueltas + bigramas de palabras adyacentes, quitando conectores/verbos de
+ *       intencion en español ("necesito", "busco", "de", "para", etc.). Nunca se embebe la
+ *       oracion completa como un solo vector.
+ *
+ *    b) RESOLVER cada frase de forma INDEPENDIENTE, en UNA sola llamada al modelo
+ *       `@cf/baai/bge-m3` (Workers AI acepta un array de textos y devuelve un vector por cada
+ *       uno - ver `extractEmbeddingVectors`), contra DOS catalogos con embedding propio:
+ *       - `service_embeddings` (112 servicios + su sector, Fase MCP-4.2) - la fuente que
+ *         encuentra empresas HOY, via el pivote `empresa_sector_service` ya poblado.
+ *       - `taxonomy_category_embeddings` (3.483 nodos CPV, Fase MCP-1, ya generados y usados por
+ *         `search_taxonomy`) - reusada tal cual, sin generar nada nuevo. Hoy NO encuentra ninguna
+ *         empresa porque `empresa_taxonomy_category` (homologacion empresa<->categoria nueva,
+ *         Fase 3/4 del proyecto de taxonomia) sigue en 0 filas - pero la consulta ya esta armada
+ *         contra ella, asi que el dia que esa homologacion cargue datos, `search_empresas`
+ *         empieza a encontrar mas empresas por esa via SIN tocar este codigo de nuevo. Esta es la
+ *         parte "escalable para cuando las empresas agreguen sus servicios/productos de la
+ *         taxonomia" que se pidio explicitamente - dos fuentes de concepto desde el dia uno, una
+ *         ya usable y otra lista para cuando tenga datos.
+ *       Cada catalogo se resuelve en UNA query SQL (`UNION ALL` de un `ORDER BY <=> LIMIT 1` por
+ *       frase, no N round-trips) - 2 queries totales sin importar cuantas frases haya. Umbral de
+ *       distancia coseno 0.60 (igual que la v1, sigue calibrado contra los mismos casos reales).
+ *
+ *    c) UNIR (no intersectar) las empresas encontradas via cualquier concepto resuelto de
+ *       cualquiera de las 2 fuentes - "no dejar oportunidades fuera": si "soldadura" resuelve a
+ *       un servicio y "tuberia" a otro, el resultado son las empresas de AMBOS servicios, no solo
+ *       de uno. Cada fila devuelta trae `match_type: 'semantic'` Y `matched_concept` (ej.
+ *       `similar a "soldadura" (servicio: MATERIALES, EQUIPOS Y ACCESORIOS PARA SOLDAR)`) -
+ *       le dice a quien consuma la tool (el agente de CIRA, o quien sea) POR QUE aparecio esa
+ *       empresa, para que la respuesta final no se preste a confusion (pedido explicito del
+ *       usuario) en vez de mostrar resultados aproximados sin explicacion.
+ *
+ *    No resuelve "grua" (equipos de izamiento): es un hueco real del catalogo, ningun servicio ni
+ *    categoria CPV existente cubre eso - ni la v1 ni esta v2 deberian inventar una respuesta ahi,
+ *    y no la dan (verificado).
+ *
+ *    BUG DE DILUCION SEMANTICA encontrado en producción (11-12 sep 2026, reportado por el
+ *    usuario probando "sordadura" -> tras corregirse el bug de publicacion de n8n, encontro que
+ *    "necesito quien me suelde tuberias" devolvia 20 empresas con la v1 de este nivel) - causa
+ *    raiz: el agente de CIRA resume la frase del usuario a un `query` compuesto de 2 conceptos
+ *    ("soldadura tuberia"), y un embedding de ESE STRING COMPLETO cae semanticamente cerca de
+ *    "TORNILLERÍA" (0.508) - ninguno de los 3 servicios mas cercanos al vector COMBINADO
+ *    mencionaba siquiera soldadura. Verificado que descomponer en "soldadura" (solo) SI encuentra
+ *    el servicio correcto (0.499, "...PARA SOLDAR") - el problema no era el catalogo ni el
+ *    umbral, era comparar un vector que mezcla 2 significados distintos contra catalogos de
+ *    conceptos unicos. La v2 de arriba resuelve esto de raiz (nunca embebe mas de un concepto por
+ *    vector) en vez de parchear el umbral o pedirle al prompt que no combine terminos (fragil:
+ *    dependeria de que el LLM nunca vuelva a hacerlo).
  */
+
+/**
+ * Palabras que no aportan significado de busqueda (conectores, pronombres, verbos de intencion) -
+ * se descartan al armar las frases candidatas del nivel semantico para no diluir el embedding de
+ * cada concepto real con ruido ("necesito quien me suelde tuberias" -> el ruido es "necesito",
+ * "quien", "me", no "suelde"/"tuberias").
+ */
+const SPANISH_STOPWORDS = new Set([
+	'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una', 'unos', 'unas', 'y', 'o', 'u', 'que',
+	'quien', 'quienes', 'para', 'por', 'con', 'sin', 'en', 'a', 'al', 'me', 'te', 'se', 'lo',
+	'su', 'sus', 'mi', 'mis', 'tu', 'tus', 'es', 'son', 'esta', 'estan', 'hay', 'como',
+	'necesito', 'necesita', 'busco', 'busca', 'buscamos', 'quiero', 'quiere', 'quisiera',
+	'dame', 'deme', 'favor', 'porfavor', 'empresa', 'empresas', 'afiliada', 'afiliadas',
+]);
+
+/**
+ * Descompone texto libre en frases candidatas cortas para el nivel semantico: palabras
+ * significativas sueltas + bigramas de palabras adyacentes. Deliberadamente NO incluye la frase
+ * original completa cuando tiene mas de 2 palabras significativas - es justo lo que causaba el
+ * bug de dilucion semantica (ver docblock de arriba). Tope defensivo de 8 frases: una consulta
+ * real de un usuario nunca necesita mas que eso, y cada frase extra es una fila mas al embedding
+ * batch (barato, pero sin motivo para no acotarlo).
+ */
+export function extractCandidatePhrases(text: string, maxPhrases = 8): string[] {
+	const normalized = text
+		.toLowerCase()
+		.normalize('NFD')
+		.replace(/[̀-ͯ]/g, '')
+		.replace(/[^a-z0-9\s]/g, ' ');
+
+	const words = normalized.split(/\s+/).filter((w) => w.length > 2 && !SPANISH_STOPWORDS.has(w));
+
+	if (words.length === 0) {
+		return [];
+	}
+
+	const phrases = new Set<string>();
+	for (const w of words) {
+		phrases.add(w);
+	}
+	for (let i = 0; i < words.length - 1; i++) {
+		phrases.add(`${words[i]} ${words[i + 1]}`);
+	}
+
+	return Array.from(phrases).slice(0, maxPhrases);
+}
+
+type ResolvedConcept = {
+	source: 'service' | 'taxonomy';
+	id: number;
+	name: string;
+	phrase: string;
+	distance: number;
+};
+
+/**
+ * Resuelve cada frase candidata contra `service_embeddings` y `taxonomy_category_embeddings` -
+ * UNA query SQL por catalogo (UNION ALL de un nearest-neighbor por frase), sin importar cuantas
+ * frases haya. Devuelve los conceptos que pasan el umbral, deduplicados por (fuente, id) quedando
+ * con la mejor (menor) distancia si una misma fila fue la mas cercana para mas de una frase.
+ */
+async function resolveSemanticConcepts(
+	sql: ReturnType<typeof getSql>,
+	env: Env,
+	phrases: string[],
+	threshold: number
+): Promise<ResolvedConcept[]> {
+	const embeddingResult = await env.AI.run('@cf/baai/bge-m3', { text: phrases });
+	const vectors = extractEmbeddingVectors(embeddingResult);
+
+	const usable = phrases.map((phrase, i) => ({ phrase, vector: vectors[i] })).filter((p): p is { phrase: string; vector: string } => !!p.vector);
+
+	if (usable.length === 0) {
+		return [];
+	}
+
+	const serviceParts = usable.map(
+		({ vector }, i) => sql`(
+			select ${i}::int as phrase_idx, sv.id, sv.name, (se.embedding <=> ${vector}::vector) as distance
+			from service_embeddings se
+			join services sv on sv.id = se.service_id
+			order by se.embedding <=> ${vector}::vector asc
+			limit 1
+		)`
+	);
+	const taxonomyParts = usable.map(
+		({ vector }, i) => sql`(
+			select ${i}::int as phrase_idx, tc.id, coalesce(tt.name, tc.code) as name, (tce.embedding <=> ${vector}::vector) as distance
+			from taxonomy_category_embeddings tce
+			join taxonomy_categories tc on tc.id = tce.category_id
+			left join taxonomy_category_translations tt on tt.category_id = tc.id and tt.locale = 'es'
+			order by tce.embedding <=> ${vector}::vector asc
+			limit 1
+		)`
+	);
+
+	const [serviceMatches, taxonomyMatches] = await Promise.all([
+		sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${serviceParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`,
+		sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${taxonomyParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`,
+	]);
+
+	const resolved: ResolvedConcept[] = [];
+	for (const m of serviceMatches) {
+		if (m.distance < threshold) resolved.push({ source: 'service', id: m.id, name: m.name, phrase: usable[m.phrase_idx].phrase, distance: m.distance });
+	}
+	for (const m of taxonomyMatches) {
+		if (m.distance < threshold) resolved.push({ source: 'taxonomy', id: m.id, name: m.name, phrase: usable[m.phrase_idx].phrase, distance: m.distance });
+	}
+
+	const bestByKey = new Map<string, ResolvedConcept>();
+	for (const r of resolved) {
+		const key = `${r.source}:${r.id}`;
+		const existing = bestByKey.get(key);
+		if (!existing || r.distance < existing.distance) bestByKey.set(key, r);
+	}
+
+	return Array.from(bestByKey.values()).sort((a, b) => a.distance - b.distance);
+}
 
 /** Columnas + joins compartidos entre las 3 queries de este archivo - evita repetir el mismo SQL 3 veces. */
 function empresaSelectAndJoins(sql: ReturnType<typeof getSql>) {
@@ -274,43 +427,65 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				}
 
 				// Nivel 3: semantico, solo para `query` (sector/ciudad son vocabulario cerrado/
-				// geografico, no texto conceptual libre) - ver docblock de arriba para el diseno.
+				// geografico, no texto conceptual libre) - ver docblock de arriba para el diseno v2
+				// (descomposicion en frases + 2 fuentes de concepto + union, en vez de un solo
+				// embedding del query completo contra un solo catalogo).
 				if (query) {
-					const embeddingResult = await env.AI.run('@cf/baai/bge-m3', { text: [query] });
-					const vector = extractEmbeddingVector(embeddingResult);
+					const phrases = extractCandidatePhrases(query);
+					const resolved = phrases.length > 0 ? await resolveSemanticConcepts(sql, env, phrases, SEMANTIC_DISTANCE_THRESHOLD) : [];
 
-					if (vector) {
-						// Los 3 servicios MAS cercanos, no "todos los que pasen el umbral" - para una
-						// consulta larga en lenguaje natural, decenas de los 112 servicios pueden caer
-						// por debajo del umbral sin ser realmente relevantes (la oracion completa se
-						// embebe "generica" y queda cerca de casi todo) - acotar a un top-N fijo evita
-						// que el resultado termine siendo "casi todo el directorio". El umbral igual se
-						// aplica: si ni el MEJOR match esta por debajo, no hay servicios candidatos.
-						const matchedServices = await sql<{ service_id: number }[]>`
-							select sv.id as service_id
-							from services sv
-							join service_embeddings se on se.service_id = sv.id
-							where (se.embedding <=> ${vector}::vector) < ${SEMANTIC_DISTANCE_THRESHOLD}
-							order by (se.embedding <=> ${vector}::vector) asc
-							limit 3
+					if (resolved.length > 0) {
+						const serviceIds = resolved.filter((r) => r.source === 'service').map((r) => r.id);
+						const taxonomyIds = resolved.filter((r) => r.source === 'taxonomy').map((r) => r.id);
+
+						const semanticRows = await sql`
+							${empresaSelectAndJoins(sql)}
+							where e.status_id = 1 and (
+								${serviceIds.length > 0 ? sql`exists (select 1 from empresa_sector_service ess where ess.empresa_id = e.id and ess.service_id in ${sql(serviceIds)})` : sql`false`}
+								or
+								${taxonomyIds.length > 0 ? sql`exists (select 1 from empresa_taxonomy_category etc where etc.empresa_id = e.id and etc.category_id in ${sql(taxonomyIds)})` : sql`false`}
+							)
+							order by e.name
+							limit ${max}
 						`;
 
-						if (matchedServices.length > 0) {
-							const serviceIds = matchedServices.map((s) => s.service_id);
-							const semanticRows = await sql`
-								${empresaSelectAndJoins(sql)}
-								where e.status_id = 1 and exists (
-									select 1 from empresa_sector_service ess
-									where ess.empresa_id = e.id and ess.service_id in ${sql(serviceIds)}
-								)
-								order by e.name
-								limit ${max}
-							`;
+						if (semanticRows.length > 0) {
+							// Para explicar CADA fila (no dejar que se preste a confusion): que concepto
+							// resuelto es el que realmente la trajo. 2 lookups baratos (acotados a los
+							// pocos ids de `resolved`, no a todo el directorio) en vez de N+1 por fila.
+							const [serviceLinks, taxonomyLinks] = await Promise.all([
+								serviceIds.length > 0
+									? sql<{ empresa_id: number; service_id: number }[]>`select empresa_id, service_id from empresa_sector_service where service_id in ${sql(serviceIds)}`
+									: Promise.resolve([] as { empresa_id: number; service_id: number }[]),
+								taxonomyIds.length > 0
+									? sql<{ empresa_id: number; category_id: number }[]>`select empresa_id, category_id from empresa_taxonomy_category where category_id in ${sql(taxonomyIds)}`
+									: Promise.resolve([] as { empresa_id: number; category_id: number }[]),
+							]);
 
-							if (semanticRows.length > 0) {
-								const tagged = semanticRows.map((r) => ({ ...r, match_type: 'semantic' as const }));
-								return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+							const bestByKey = new Map(resolved.map((r) => [`${r.source}:${r.id}`, r]));
+
+							function matchedConceptFor(empresaId: number): string {
+								let best: ResolvedConcept | null = null;
+								for (const link of serviceLinks) {
+									if (link.empresa_id !== empresaId) continue;
+									const r = bestByKey.get(`service:${link.service_id}`);
+									if (r && (!best || r.distance < best.distance)) best = r;
+								}
+								for (const link of taxonomyLinks) {
+									if (link.empresa_id !== empresaId) continue;
+									const r = bestByKey.get(`taxonomy:${link.category_id}`);
+									if (r && (!best || r.distance < best.distance)) best = r;
+								}
+								if (!best) return 'similar por servicio o categoría relacionada';
+								return `similar a "${best.phrase}" (${best.source === 'service' ? 'servicio' : 'categoría'}: ${best.name})`;
 							}
+
+							const tagged = semanticRows.map((r) => ({
+								...r,
+								match_type: 'semantic' as const,
+								matched_concept: matchedConceptFor(Number(r.id)),
+							}));
+							return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 						}
 					}
 				}

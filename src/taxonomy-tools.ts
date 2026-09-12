@@ -175,11 +175,21 @@ export function registerTaxonomyTools(server: McpServer, env: Env): void {
 
 /** Misma forma de respuesta verificada empíricamente en handleEmbed() de index.ts. Exportada: la reusa empresa-tools.ts para el fallback semántico de search_empresas. */
 export function extractEmbeddingVector(result: unknown): string | null {
+	return extractEmbeddingVectors(result)[0] ?? null;
+}
+
+/**
+ * Igual que `extractEmbeddingVector` pero devuelve TODOS los vectores de una respuesta con
+ * varios textos de entrada (`env.AI.run(..., { text: [t1, t2, ...] })` -> `data: number[][]`,
+ * uno por texto, en el mismo orden) - usada por el fallback semantico de `search_empresas`
+ * (Fase MCP-4.3) para embeber varias frases candidatas en una sola llamada al modelo.
+ */
+export function extractEmbeddingVectors(result: unknown): (string | null)[] {
 	const data = (result as any)?.data ?? (result as any)?.response?.data;
 
-	if (!Array.isArray(data) || !Array.isArray(data[0])) {
-		return null;
+	if (!Array.isArray(data)) {
+		return [];
 	}
 
-	return '[' + data[0].join(',') + ']';
+	return data.map((vec: unknown) => (Array.isArray(vec) ? '[' + vec.join(',') + ']' : null));
 }
