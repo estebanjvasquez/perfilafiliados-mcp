@@ -464,15 +464,20 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 
 							const bestByKey = new Map(resolved.map((r) => [`${r.source}:${r.id}`, r]));
 
-							function matchedConceptFor(empresaId: number): string {
+							// postgres.js devuelve columnas bigint como STRING (evita perder precision) - comparar
+							// con `!==` estricto contra un Number, como se hacia antes, nunca matchea ("88" !== 88)
+							// y esta funcion siempre caia al texto generico de abajo (bug real encontrado al
+							// verificar en vivo: toda fila semantica mostraba "similar por servicio o categoria
+							// relacionada" en vez del concepto real). Fix: normalizar ambos lados con String().
+							function matchedConceptFor(empresaId: string): string {
 								let best: ResolvedConcept | null = null;
 								for (const link of serviceLinks) {
-									if (link.empresa_id !== empresaId) continue;
+									if (String(link.empresa_id) !== empresaId) continue;
 									const r = bestByKey.get(`service:${link.service_id}`);
 									if (r && (!best || r.distance < best.distance)) best = r;
 								}
 								for (const link of taxonomyLinks) {
-									if (link.empresa_id !== empresaId) continue;
+									if (String(link.empresa_id) !== empresaId) continue;
 									const r = bestByKey.get(`taxonomy:${link.category_id}`);
 									if (r && (!best || r.distance < best.distance)) best = r;
 								}
@@ -483,7 +488,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							const tagged = semanticRows.map((r) => ({
 								...r,
 								match_type: 'semantic' as const,
-								matched_concept: matchedConceptFor(Number(r.id)),
+								matched_concept: matchedConceptFor(String(r.id)),
 							}));
 							return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 						}
