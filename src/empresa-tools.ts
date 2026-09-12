@@ -99,11 +99,16 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *    c) UNIR (no intersectar) las empresas encontradas via cualquier concepto resuelto de
  *       cualquiera de las 2 fuentes - "no dejar oportunidades fuera": si "soldadura" resuelve a
  *       un servicio y "tuberia" a otro, el resultado son las empresas de AMBOS servicios, no solo
- *       de uno. Cada fila devuelta trae `match_type: 'semantic'` Y `matched_concept` (ej.
+ *       de uno. Cada fila devuelta trae `match_type: 'semantic'` Y `matched_via` (ej.
  *       `similar a "soldadura" (servicio: MATERIALES, EQUIPOS Y ACCESORIOS PARA SOLDAR)`) -
  *       le dice a quien consuma la tool (el agente de CIRA, o quien sea) POR QUE aparecio esa
- *       empresa, para que la respuesta final no se preste a confusion (pedido explicito del
- *       usuario) en vez de mostrar resultados aproximados sin explicacion.
+ *       empresa. `matched_via` (12 sep 2026, Fase MCP-4.4) no es exclusivo del nivel semantico:
+ *       los niveles exacto/difuso TAMBIEN lo traen (mismo texto para todas las filas de esa
+ *       respuesta, ej. `sector: servicios a pozos`), porque un `sector` amplio puede agrupar
+ *       empresas por motivos bien distintos entre si (ver Fase MCP-4.4 mas abajo) y sin esta
+ *       referencia no habia forma de saber, mirando la respuesta, si el match era literal o
+ *       aproximado - pedido explicito del usuario ("incluye en todas las consultas una
+ *       referencia de proximidad").
  *
  *    No resuelve "grua" (equipos de izamiento): es un hueco real del catalogo, ningun servicio ni
  *    categoria CPV existente cubre eso - ni la v1 ni esta v2 deberian inventar una respuesta ahi,
@@ -395,6 +400,23 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				return conditions.reduce((acc, c) => sql`${acc} and ${c}`);
 			}
 
+			// Explica CADA respuesta (no solo la semantica) - pedido explicito del usuario tras ver
+			// que una busqueda por `sector` (46 empresas de "SERVICIOS A POZOS" para "perforacion",
+			// de las cuales solo 14 tienen perforacion literal entre sus servicios - las otras 32
+			// estan ahi por cementacion/wireline/otros servicios del mismo sector institucional, no
+			// por perforacion en si) no dejaba ver POR QUE aparecia cada empresa. Uniforme para
+			// exacto/difuso: no hace falta un round-trip extra, ya sabemos que parametros se usaron
+			// y son los mismos para TODAS las filas de una misma respuesta (a diferencia del
+			// semantico, donde cada fila puede venir de un concepto distinto - ver `matchedConceptFor`
+			// mas abajo, que sigue siendo por-fila).
+			function describeMatch(tier: 'exact' | 'fuzzy'): string {
+				const parts: string[] = [];
+				if (query) parts.push(tier === 'exact' ? `coincide con "${query}"` : `similar a "${query}" (posible diferencia de tipeo)`);
+				if (sector) parts.push(`sector: ${sector}`);
+				if (ciudad) parts.push(`ciudad o estado: ${ciudad}`);
+				return parts.join(' · ');
+			}
+
 			try {
 				const exactRows = await sql`
 					${empresaSelectAndJoins(sql)}
@@ -404,7 +426,8 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				`;
 
 				if (exactRows.length > 0) {
-					const tagged = exactRows.map((r) => ({ ...r, match_type: 'exact' as const }));
+					const matchedVia = describeMatch('exact');
+					const tagged = exactRows.map((r) => ({ ...r, match_type: 'exact' as const, matched_via: matchedVia }));
 					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 				}
 
@@ -421,7 +444,8 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					`;
 
 					if (fuzzyRows.length > 0) {
-						const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const }));
+						const matchedVia = describeMatch('fuzzy');
+						const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: matchedVia }));
 						return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 					}
 				}
@@ -469,7 +493,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							// y esta funcion siempre caia al texto generico de abajo (bug real encontrado al
 							// verificar en vivo: toda fila semantica mostraba "similar por servicio o categoria
 							// relacionada" en vez del concepto real). Fix: normalizar ambos lados con String().
-							function matchedConceptFor(empresaId: string): string {
+							function matchedViaFor(empresaId: string): string {
 								let best: ResolvedConcept | null = null;
 								for (const link of serviceLinks) {
 									if (String(link.empresa_id) !== empresaId) continue;
@@ -488,7 +512,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							const tagged = semanticRows.map((r) => ({
 								...r,
 								match_type: 'semantic' as const,
-								matched_concept: matchedConceptFor(String(r.id)),
+								matched_via: matchedViaFor(String(r.id)),
 							}));
 							return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 						}
