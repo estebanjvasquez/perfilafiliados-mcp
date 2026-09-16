@@ -171,6 +171,72 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  * en PARALELO al nivel difuso (`Promise.all`, sin round-trips extra secuenciales), y sus empresas
  * se UNEN a las del difuso en vez de necesitar que el difuso fallara primero. El nivel EXACTO (1)
  * no se tocó - sigue siendo un "ganador único" sin cambios, cero riesgo de regresión ahí.
+ *
+ * FASE MCP-5 (16 sep 2026, ver docs/taxonomia/plan_mcp_cira.md): 3 fuentes de datos reales que
+ * hasta esta fecha CIRA no consultaba en absoluto, pese a existir en el sistema (perfil de afiliado,
+ * módulos opcionales - `EmpresaModuleStatus.php` en Laravel) - viven en MySQL producción, se
+ * sincronizan a pgsql con comandos Artisan nuevos (`empresas:sync-certifications`,
+ * `empresas:sync-sustainability`, `empresas:sync-experiencias`), nunca se escribe en mysql desde
+ * acá. Mismo criterio arquitectónico que la taxonomía (Fase MCP-4.6): las 3 se resuelven en
+ * PARALELO, no como último recurso, y ninguna requiere un parámetro nuevo en la tool - todas
+ * entran por el mismo `query` de siempre, consistente con la "REGLA UNICA" ya establecida en el
+ * prompt de CIRA (no se tocó el prompt para esta fase).
+ *
+ * 1. CERTIFICACIONES (`empresa_certifications`, espejo de `management`/Gestión) - columnas
+ *    booleanas reales (ISO9001, ISO14001, ISO45001, ISO27001, ISO50001, ISO17025, ISO37001, DUN,
+ *    OVID, PMI). `detectCertificationColumn()` normaliza el `query` (saca todo lo que no sea
+ *    letra/número) y busca el token - tolera "ISO 9001"/"iso-9001"/"ISO9001" por igual. También
+ *    matchea por ILIKE contra `otras_certificaciones` (texto libre real de 38 empresas que
+ *    reportaron una certificación propia no listada, ej. "SISTEMA DE GESTIÓN AMBIENTAL PROPIO").
+ *
+ * 2. SOSTENIBILIDAD (`empresa_sustainability_areas` + `sustainability_areas`, espejo de
+ *    `sustainabilities`/Sostenibilidad) - catálogo cerrado de 8 áreas (modelo de economía circular).
+ *    Los nombres reales son la descripción técnica del modelo (ej. "REORIENTACIÓN DEL OBJETO POR Y
+ *    PARA LA SOCIEDAD O EL AMBIENTE") - nadie los escribe tal cual, así que cada área tiene
+ *    `synonyms` curados a mano (ej. "reciclaje, residuos, desechos" para el área de valorización de
+ *    desechos) contra los que también se matchea por ILIKE. Sin embeddings: 8 categorías no
+ *    justifican esa complejidad.
+ *
+ * 3. EXPERIENCIAS (`empresa_experiencias` + `empresa_experiencia_embeddings`, aplanado de
+ *    `experiences`/Experiencias) - cada fila es UN proyecto ejecutado (antes vivían todos juntos en
+ *    un JSON por empresa). Híbrido léxico + semántico igual que la taxonomía: `resolveLexicalExperiencias`
+ *    (ILIKE directo contra la descripción) y una tercera fuente dentro de `resolveSemanticConcepts`
+ *    (`source: 'experiencia'`, mismas frases candidatas que ya se arman para la taxonomía - la
+ *    descomposición es una propiedad del `query` del usuario, no del catálogo). Es la fuente más
+ *    aproximada de las 6 (texto libre idiosincrático por proyecto) - va última en el orden de
+ *    prioridad del merge final.
+ *
+ * Quedan afuera de esta fase (decisión explícita del usuario, revisar después): Presencia
+ * (`presences` - oficinas por país, clientes reales) y Recursos/Activos (`assets` - maquinaria/
+ * personal/instalaciones, códigos numéricos sin catálogo decodificador confirmado todavía).
+ *
+ * CALIBRACIÓN DEL UMBRAL SEMÁNTICO DE EXPERIENCIAS (16 sep 2026) - encontrado en vivo probando esta
+ * misma fase: con el umbral general (0.6), "ISO 9001"/"reciclaje" (que YA tenían una respuesta
+ * perfecta vía certificación/sostenibilidad) TAMBIÉN activaban ruido semántico de experiencias (ej.
+ * "iso" resolvía a "Esta es una carga de prueba", distancia 0.54 - un registro de prueba real en la
+ * tabla). Medido: coincidencias genuinas (`construccion` 0.38-0.42, `vialidad` 0.48-0.49) vs. ruido
+ * (`iso`/`9001` 0.53-0.57, `represas` como hueco real del catálogo 0.50-0.53) - separación limpia en
+ * 0.50, ver `EXPERIENCIA_SEMANTIC_DISTANCE_THRESHOLD`.
+ *
+ * HALLAZGO POSITIVO, NO UNA REGRESIÓN - "grua" (documentado en TODA esta sesión como "hueco real
+ * del catálogo, nunca debe dar respuesta", ver `TRGM_THRESHOLD` más abajo) ahora SÍ devuelve 2
+ * empresas reales vía coincidencia LÉXICA (no semántica) de experiencias: una tiene literalmente
+ * "MANTENIMIENTO PREVENTIVO Y CORRECTIVO DE PUENTE DE GRUAS DE 5 Y 15 TONELADAS" en su historial de
+ * proyectos. Esto es exactamente el propósito de esta fase: "grua" seguía siendo un hueco real del
+ * catálogo de SERVICIOS (sectors/services nunca tuvo esa categoría), pero SÍ hay evidencia real de
+ * experiencia con grúas que ningún otro nivel podía alcanzar. El test de regresión histórico "grua
+ * debe dar []" queda actualizado: sigue valiendo para los niveles exacto/difuso/certificación/
+ * sostenibilidad/taxonomía (que siguen dando vacío ahí, correctamente) pero YA NO para el conjunto
+ * completo de `search_empresas` tras esta fase.
+ *
+ * LÍMITE ACEPTADO, NO PERSEGUIDO MÁS - una palabra suelta como "represa" o "rehabilitacion" (sin
+ * más contexto) puede acercarse semánticamente a proyectos relacionados solo por vocabulario de
+ * ingeniería civil compartido pero sin relación temática real (ej. "represa" ~ drenajes de relleno
+ * sanitario a 0.49; "rehabilitacion" ~ reformación catalítica de una planta a 0.46) - ambos casos
+ * DENTRO del umbral de 0.50 porque bajarlo más excluiría coincidencias genuinas de "vialidad"
+ * (0.48-0.49). Mismo criterio ya aceptado en este archivo para "reciclaje"~"VIALIDAD Y DRENAJES"
+ * (nivel semántico de servicios, Fase MCP-4.6): un límite documentado y conocido, no perseguido con
+ * más ajuste de umbral porque la alternativa (subir el umbral) pierde valor real neto.
  */
 
 /**
@@ -254,7 +320,7 @@ export function extractCandidatePhrasesForTaxonomy(text: string, maxPhrases = 8)
 }
 
 type ResolvedConcept = {
-	source: 'service' | 'taxonomy';
+	source: 'service' | 'taxonomy' | 'experiencia';
 	id: number;
 	name: string;
 	phrase: string;
@@ -262,6 +328,77 @@ type ResolvedConcept = {
 };
 
 type LexicalTaxonomyMatch = { id: number; name: string };
+
+/**
+ * Certificaciones reales del módulo "Gestión" (`management`, MySQL) sincronizadas a
+ * `empresa_certifications` (Fase MCP-5.1, ver `SyncEmpresaCertifications.php`). Detecta la columna
+ * booleana que corresponde a lo que escribió el usuario, tolerando las formas comunes de escribir
+ * un código ISO ("ISO 9001", "iso-9001", "ISO9001") - se normaliza sacando todo lo que no sea
+ * letra/número antes de buscar el token. `dun`/`ovid`/`pmi` son códigos cortos pero reales del
+ * propio formulario de Gestión del panel - riesgo de colisión bajo (a diferencia de "grua", no son
+ * fragmentos que aparezcan sueltos dentro de otras palabras de uso común en español).
+ */
+const CERTIFICATION_TOKEN_TO_COLUMN: Record<string, string> = {
+	iso9001: 'iso9001',
+	iso14001: 'iso14001',
+	iso45001: 'iso45001',
+	iso27001: 'iso27001',
+	iso50001: 'iso50001',
+	iso17025: 'iso17025',
+	iso37001: 'iso37001',
+	dun: 'dun',
+	ovid: 'ovid',
+	pmi: 'pmi',
+};
+
+function detectCertificationColumn(query: string): string | null {
+	const normalized = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+	for (const [token, column] of Object.entries(CERTIFICATION_TOKEN_TO_COLUMN)) {
+		if (normalized.includes(token)) {
+			return column;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Condición SQL para la columna booleana detectada - por `switch` explícito (no interpolación
+ * dinámica de identificador) porque `column` sale de un Record con un set fijo y chico de claves
+ * conocidas, no hace falta ni conviene la complejidad de armar el nombre de columna en runtime.
+ */
+function certificationFlagCondition(sql: ReturnType<typeof getSql>, column: string | null) {
+	switch (column) {
+		case 'iso9001':
+			return sql`ec.iso9001 = true`;
+		case 'iso14001':
+			return sql`ec.iso14001 = true`;
+		case 'iso45001':
+			return sql`ec.iso45001 = true`;
+		case 'iso27001':
+			return sql`ec.iso27001 = true`;
+		case 'iso50001':
+			return sql`ec.iso50001 = true`;
+		case 'iso17025':
+			return sql`ec.iso17025 = true`;
+		case 'iso37001':
+			return sql`ec.iso37001 = true`;
+		case 'dun':
+			return sql`ec.dun = true`;
+		case 'ovid':
+			return sql`ec.ovid = true`;
+		case 'pmi':
+			return sql`ec.pmi = true`;
+		default:
+			return sql`false`;
+	}
+}
+
+/** Recorta texto libre largo (ej. descripción de un proyecto) para no inflar `matched_via`. */
+function truncateText(text: string, max = 100): string {
+	return text.length > max ? text.slice(0, max).trimEnd() + '…' : text;
+}
 
 /**
  * Familias CPV "agujero negro" - nombre lo bastante genérico como para atraer coincidencias léxicas
@@ -328,6 +465,43 @@ async function resolveLexicalTaxonomyMatches(sql: ReturnType<typeof getSql>, que
 	return rows;
 }
 
+type LexicalSustainabilityMatch = { area_id: number; name: string };
+
+/**
+ * Match léxico contra el catálogo cerrado de 8 áreas de sostenibilidad (`sustainability_areas`,
+ * Fase MCP-5.2) - contra el NOMBRE real del área (técnico, poco probable que un usuario lo escriba
+ * tal cual) y contra sus `synonyms` curados a mano (la forma coloquial real, ej. "reciclaje").
+ */
+async function resolveLexicalSustainabilityAreas(sql: ReturnType<typeof getSql>, query: string): Promise<LexicalSustainabilityMatch[]> {
+	const rows = await sql<{ area_id: number; name: string }[]>`
+		select id as area_id, name
+		from sustainability_areas
+		where unaccent(name) ilike unaccent(${'%' + query + '%'})
+			or unaccent(coalesce(synonyms, '')) ilike unaccent(${'%' + query + '%'})
+	`;
+
+	return rows;
+}
+
+type LexicalExperienciaMatch = { id: number; empresa_id: number; descripcion: string };
+
+/**
+ * Match léxico DIRECTO (frase completa, no descompuesta) contra la descripción libre de un
+ * proyecto ejecutado (`empresa_experiencias`, Fase MCP-5.3) - mismo criterio que
+ * `resolveLexicalTaxonomyMatches`: cubre el caso en que el usuario ya usa casi las mismas palabras
+ * que la empresa puso en su descripción, sin necesitar el modelo de embeddings para eso.
+ */
+async function resolveLexicalExperiencias(sql: ReturnType<typeof getSql>, query: string): Promise<LexicalExperienciaMatch[]> {
+	const rows = await sql<{ id: number; empresa_id: number; descripcion: string }[]>`
+		select id, empresa_id, descripcion
+		from empresa_experiencias
+		where unaccent(descripcion) ilike unaccent(${'%' + query + '%'})
+		limit 20
+	`;
+
+	return rows;
+}
+
 /**
  * Resuelve cada frase candidata contra `service_embeddings` y `taxonomy_category_embeddings` -
  * UNA query SQL por catalogo (UNION ALL de un nearest-neighbor por frase), sin importar cuantas
@@ -362,12 +536,14 @@ async function resolveSemanticConcepts(
 	env: Env,
 	servicePhrases: string[],
 	taxonomyPhrases: string[],
-	threshold: number
+	experienciaPhrases: string[],
+	threshold: number,
+	experienciaThreshold: number
 ): Promise<ResolvedConcept[]> {
-	// UNA sola llamada al modelo para las frases de AMBOS catálogos (aunque sean listas distintas -
+	// UNA sola llamada al modelo para las frases de LOS 3 catálogos (aunque sean listas distintas -
 	// ver docblock de `extractCandidatePhrasesForTaxonomy`) - se embebe la unión sin duplicados, y
 	// cada catálogo busca su vector por texto en el mapa resultante.
-	const allPhrases = Array.from(new Set([...servicePhrases, ...taxonomyPhrases]));
+	const allPhrases = Array.from(new Set([...servicePhrases, ...taxonomyPhrases, ...experienciaPhrases]));
 
 	if (allPhrases.length === 0) {
 		return [];
@@ -383,8 +559,11 @@ async function resolveSemanticConcepts(
 	const usableTaxonomy = taxonomyPhrases
 		.map((phrase) => ({ phrase, vector: vectorByPhrase.get(phrase) }))
 		.filter((p): p is { phrase: string; vector: string } => !!p.vector);
+	const usableExperiencia = experienciaPhrases
+		.map((phrase) => ({ phrase, vector: vectorByPhrase.get(phrase) }))
+		.filter((p): p is { phrase: string; vector: string } => !!p.vector);
 
-	if (usableService.length === 0 && usableTaxonomy.length === 0) {
+	if (usableService.length === 0 && usableTaxonomy.length === 0 && usableExperiencia.length === 0) {
 		return [];
 	}
 
@@ -409,13 +588,29 @@ async function resolveSemanticConcepts(
 			limit 5
 		)`
 	);
+	// Fase MCP-5.3: mismo criterio que la taxonomía (limit 5, no 1) - las descripciones de proyectos
+	// son texto libre idiosincrático, mucho menos denso que servicios (112) pero con más variación de
+	// redacción por proyecto que categorías CPV - dar varias chances por frase reduce el riesgo de
+	// perder el proyecto correcto por no ser el vecino más cercano absoluto.
+	const experienciaParts = usableExperiencia.map(
+		({ vector }, i) => sql`(
+			select ${i}::int as phrase_idx, ee.id, ee.descripcion as name, (eee.embedding <=> ${vector}::vector) as distance
+			from empresa_experiencia_embeddings eee
+			join empresa_experiencias ee on ee.id = eee.experiencia_id
+			order by eee.embedding <=> ${vector}::vector asc
+			limit 5
+		)`
+	);
 
-	const [serviceMatches, taxonomyMatches] = await Promise.all([
+	const [serviceMatches, taxonomyMatches, experienciaMatches] = await Promise.all([
 		serviceParts.length > 0
 			? sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${serviceParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`
 			: Promise.resolve([]),
 		taxonomyParts.length > 0
 			? sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${taxonomyParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`
+			: Promise.resolve([]),
+		experienciaParts.length > 0
+			? sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${experienciaParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`
 			: Promise.resolve([]),
 	]);
 
@@ -425,6 +620,9 @@ async function resolveSemanticConcepts(
 	}
 	for (const m of taxonomyMatches) {
 		if (m.distance < threshold) resolved.push({ source: 'taxonomy', id: m.id, name: m.name, phrase: usableTaxonomy[m.phrase_idx].phrase, distance: m.distance });
+	}
+	for (const m of experienciaMatches) {
+		if (m.distance < experienciaThreshold) resolved.push({ source: 'experiencia', id: m.id, name: m.name, phrase: usableExperiencia[m.phrase_idx].phrase, distance: m.distance });
 	}
 
 	const bestByKey = new Map<string, ResolvedConcept>();
@@ -470,11 +668,14 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			description:
 				'Busca empresas afiliadas a la Cámara Petrolera de Venezuela. Requiere al menos un filtro ' +
 				'(query, sector, ciudad o categoria_codigo) - no permite listar todas las empresas sin filtrar. ' +
-				'"query" busca por nombre de empresa, servicio o sector en texto libre. "ciudad" matchea ciudad o ' +
-				'estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva (con datos reales desde ' +
-				'el 15 sep 2026, Fase 3/4 de taxonomía) - rara vez hace falta usarlo porque "query" en texto ' +
-				'libre ya encuentra esas categorías automáticamente; reservarlo para cuando el usuario da un ' +
-				'código CPV exacto o pide explícitamente navegar la taxonomía por código.',
+				'"query" busca por nombre de empresa, servicio o sector en texto libre, y TAMBIÉN por ' +
+				'certificaciones (ej. "ISO 9001"), áreas de sostenibilidad (ej. "reciclaje", "energías ' +
+				'renovables") y experiencia en proyectos ejecutados (ej. "represas", "vialidad") - no hace ' +
+				'falta ningún parámetro especial para esto, "query" ya lo resuelve todo junto. "ciudad" ' +
+				'matchea ciudad o estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva ' +
+				'(con datos reales desde el 15 sep 2026, Fase 3/4 de taxonomía) - rara vez hace falta usarlo ' +
+				'porque "query" en texto libre ya encuentra esas categorías automáticamente; reservarlo para ' +
+				'cuando el usuario da un código CPV exacto o pide explícitamente navegar la taxonomía por código.',
 			inputSchema: {
 				query: z.string().min(2).optional().describe('Texto libre: nombre de empresa, servicio o sector'),
 				sector: z.string().optional().describe('Nombre (parcial) de uno de los 8 sectores institucionales, ej. "construccion"'),
@@ -529,6 +730,18 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			const TRGM_THRESHOLD = 0.5;
 			// Umbral de distancia coseno para el fallback semantico - ver docblock de arriba.
 			const SEMANTIC_DISTANCE_THRESHOLD = 0.6;
+			// Fase MCP-5.3 (16 sep 2026) - bug real encontrado en vivo probando esta misma fase: con el
+			// umbral general (0.6), consultas de certificacion/sostenibilidad ("ISO 9001", "reciclaje")
+			// tambien activaban el nivel semantico de experiencias y devolvian empresas sin relacion
+			// real (ej. "iso" resolvia a "Esta es una carga de prueba" a distancia 0.54). Medido en vivo
+			// contra datos reales: coincidencias GENUINAS de experiencia caen entre 0.38 ("construccion"
+			// -> "CONSTRUCCION EDIFICIO...") y 0.49 ("vialidad" -> "REHABILITACION VIAL..."); el ruido
+			// ("iso"/"9001"/"represas", este ultimo un hueco real del catalogo que debe dar vacio) cae
+			// entre 0.50 y 0.57 - separacion limpia. Las descripciones de proyecto son texto libre mucho
+			// mas variado que nombres de servicio/categoria CPV (que SI se quedan en 0.6, ya calibrados,
+			// sin evidencia de que haga falta tocarlos), así que el nivel de experiencias usa su PROPIO
+			// umbral, mas estricto.
+			const EXPERIENCIA_SEMANTIC_DISTANCE_THRESHOLD = 0.5;
 
 			/** Arma el WHERE - `fuzzy=false` es el ILIKE exacto de siempre; `fuzzy=true` es el fallback por similitud. */
 			function buildConditions(fuzzy: boolean) {
@@ -690,10 +903,49 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						? (() => {
 								const servicePhrases = extractCandidatePhrases(query);
 								const taxonomyPhrases = extractCandidatePhrasesForTaxonomy(query);
+								// Fase MCP-5.3: mismas frases candidatas que la taxonomía (misma lógica de
+								// descomposición aplica - la descomposición es una propiedad de la CONSULTA del
+								// usuario, no del catálogo contra el que se compara).
 								return servicePhrases.length > 0 || taxonomyPhrases.length > 0
-									? resolveSemanticConcepts(sql, env, servicePhrases, taxonomyPhrases, SEMANTIC_DISTANCE_THRESHOLD)
+									? resolveSemanticConcepts(
+										sql,
+										env,
+										servicePhrases,
+										taxonomyPhrases,
+										taxonomyPhrases,
+										SEMANTIC_DISTANCE_THRESHOLD,
+										EXPERIENCIA_SEMANTIC_DISTANCE_THRESHOLD
+									)
 									: Promise.resolve([]);
 							})()
+						: Promise.resolve([]);
+					// FASE MCP-5 (16 sep 2026, ver docs/taxonomia/plan_mcp_cira.md): certificaciones
+					// (Gestión), áreas de sostenibilidad y experiencias de proyectos - 3 fuentes reales que
+					// hasta hoy CIRA no consultaba en absoluto (viven en MySQL, nunca se replicaron a
+					// pgsql). Mismo criterio arquitectónico que la taxonomía en Fase MCP-4.6: se resuelven
+					// en PARALELO, nunca detrás del catálogo viejo.
+					const certificationColumn = query ? detectCertificationColumn(query) : null;
+					const certificationRowsPromise: Promise<EmpresaSearchRow[]> = query
+						? sql<EmpresaSearchRow[]>`
+							${empresaSelectAndJoins(sql)}
+							where e.status_id = 1
+								and exists (
+									select 1 from empresa_certifications ec
+									where ec.empresa_id = e.id
+										and (
+											${certificationFlagCondition(sql, certificationColumn)}
+											or unaccent(coalesce(ec.otras_certificaciones, '')) ilike unaccent(${'%' + query + '%'})
+										)
+								)
+							order by e.name
+							limit ${max}
+						`
+						: Promise.resolve([]);
+					const lexicalSustainabilityPromise: Promise<LexicalSustainabilityMatch[]> = query
+						? resolveLexicalSustainabilityAreas(sql, query)
+						: Promise.resolve([]);
+					const lexicalExperienciaPromise: Promise<LexicalExperienciaMatch[]> = query
+						? resolveLexicalExperiencias(sql, query)
 						: Promise.resolve([]);
 					// FASE MCP-4.7 (15 sep 2026) - bug real: "Vincler" (typo de "VINCCLER", la empresa
 					// real) sin sufijo legal ni frase de "dame información sobre..." hace que el
@@ -748,12 +1000,16 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						`
 						: Promise.resolve([]);
 
-					const [fuzzyRows, lexicalTaxonomy, semanticResolved, nameTypoRows] = await Promise.all([
-						fuzzyRowsPromise,
-						lexicalTaxonomyPromise,
-						semanticResolvedPromise,
-						nameTypoRowsPromise,
-					]);
+					const [fuzzyRows, lexicalTaxonomy, semanticResolved, nameTypoRows, certificationRows, lexicalSustainability, lexicalExperiencia] =
+						await Promise.all([
+							fuzzyRowsPromise,
+							lexicalTaxonomyPromise,
+							semanticResolvedPromise,
+							nameTypoRowsPromise,
+							certificationRowsPromise,
+							lexicalSustainabilityPromise,
+							lexicalExperienciaPromise,
+						]);
 
 					const semanticTaxonomy = semanticResolved.filter((r) => r.source === 'taxonomy');
 					const taxonomyIds = Array.from(new Set([...lexicalTaxonomy.map((r) => r.id), ...semanticTaxonomy.map((r) => r.id)]));
@@ -769,11 +1025,49 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							`
 							: ([] as EmpresaSearchRow[]);
 
-					if (nameTypoRows.length > 0 || fuzzyRows.length > 0 || taxonomyRows.length > 0) {
+					const sustainabilityAreaIds = Array.from(new Set(lexicalSustainability.map((r) => r.area_id)));
+					const sustainabilityRows =
+						sustainabilityAreaIds.length > 0
+							? await sql<EmpresaSearchRow[]>`
+								${empresaSelectAndJoins(sql)}
+								where e.status_id = 1
+									and exists (select 1 from empresa_sustainability_areas esa where esa.empresa_id = e.id and esa.area_id in ${sql(sustainabilityAreaIds)})
+								order by e.name
+								limit ${max}
+							`
+							: ([] as EmpresaSearchRow[]);
+
+					const semanticExperiencia = semanticResolved.filter((r) => r.source === 'experiencia');
+					const experienciaIds = Array.from(new Set([...lexicalExperiencia.map((r) => r.id), ...semanticExperiencia.map((r) => r.id)]));
+					const experienciaRows =
+						experienciaIds.length > 0
+							? await sql<EmpresaSearchRow[]>`
+								${empresaSelectAndJoins(sql)}
+								where e.status_id = 1
+									and exists (select 1 from empresa_experiencias ee where ee.empresa_id = e.id and ee.id in ${sql(experienciaIds)})
+								order by e.name
+								limit ${max}
+							`
+							: ([] as EmpresaSearchRow[]);
+
+					if (
+						nameTypoRows.length > 0 ||
+						fuzzyRows.length > 0 ||
+						taxonomyRows.length > 0 ||
+						certificationRows.length > 0 ||
+						sustainabilityRows.length > 0 ||
+						experienciaRows.length > 0
+					) {
 						const nameTypoMatchedVia = `similar a "${query}" (nombre de empresa, posible diferencia de tipeo)`;
 						const fuzzyMatchedVia = describeMatch('fuzzy');
+						const certificationMatchedVia = certificationColumn
+							? `coincide con la certificación ${certificationColumn.toUpperCase()}`
+							: `coincide con "${query}" (otras certificaciones)`;
 						const lexicalByCategoryId = new Map(lexicalTaxonomy.map((r) => [r.id, r]));
 						const semanticByCategoryId = new Map(semanticTaxonomy.map((r) => [r.id, r]));
+						const sustainabilityAreaById = new Map(lexicalSustainability.map((r) => [r.area_id, r]));
+						const lexicalExperienciaById = new Map(lexicalExperiencia.map((r) => [r.id, r]));
+						const semanticExperienciaById = new Map(semanticExperiencia.map((r) => [r.id, r]));
 
 						// Igual que en el nivel semántico de más abajo: acotado a los pocos ids
 						// resueltos, no a todo el directorio.
@@ -781,6 +1075,18 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							taxonomyIds.length > 0
 								? await sql<{ empresa_id: number; category_id: number }[]>`
 									select empresa_id, category_id from empresa_taxonomy_category where category_id in ${sql(taxonomyIds)}
+								`
+								: [];
+						const sustainabilityLinks =
+							sustainabilityAreaIds.length > 0
+								? await sql<{ empresa_id: number; area_id: number }[]>`
+									select empresa_id, area_id from empresa_sustainability_areas where area_id in ${sql(sustainabilityAreaIds)}
+								`
+								: [];
+						const experienciaLinks =
+							experienciaIds.length > 0
+								? await sql<{ empresa_id: number; id: number }[]>`
+									select empresa_id, id from empresa_experiencias where id in ${sql(experienciaIds)}
 								`
 								: [];
 
@@ -797,6 +1103,28 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							return 'coincide con la taxonomía CPV';
 						}
 
+						function sustainabilityMatchedViaFor(empresaId: string): string {
+							const areaIds = sustainabilityLinks.filter((l) => String(l.empresa_id) === empresaId).map((l) => l.area_id);
+							for (const id of areaIds) {
+								const area = sustainabilityAreaById.get(id);
+								if (area) return `coincide con "${query}" (área de sostenibilidad: ${area.name})`;
+							}
+							return 'coincide con un área de sostenibilidad';
+						}
+
+						function experienciaMatchedViaFor(empresaId: string): string {
+							const ids = experienciaLinks.filter((l) => String(l.empresa_id) === empresaId).map((l) => l.id);
+							for (const id of ids) {
+								const lex = lexicalExperienciaById.get(id);
+								if (lex) return `coincide con "${query}" (experiencia: ${truncateText(lex.descripcion)})`;
+							}
+							for (const id of ids) {
+								const sem = semanticExperienciaById.get(id);
+								if (sem) return `similar a "${sem.phrase}" (experiencia: ${truncateText(sem.name)})`;
+							}
+							return 'coincide con un proyecto ejecutado';
+						}
+
 						const taggedNameTypo = nameTypoRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: nameTypoMatchedVia }));
 						const taggedFuzzy = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: fuzzyMatchedVia }));
 						const taggedTaxonomy = taxonomyRows.map((r) => ({
@@ -804,13 +1132,42 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							match_type: 'taxonomy' as const,
 							matched_via: taxonomyMatchedViaFor(String(r.id)),
 						}));
+						const taggedCertification = certificationRows.map((r) => ({
+							...r,
+							match_type: 'certification' as const,
+							matched_via: certificationMatchedVia,
+						}));
+						const taggedSustainability = sustainabilityRows.map((r) => ({
+							...r,
+							match_type: 'sustainability' as const,
+							matched_via: sustainabilityMatchedViaFor(String(r.id)),
+						}));
+						const taggedExperiencia = experienciaRows.map((r) => ({
+							...r,
+							match_type: 'experiencia' as const,
+							matched_via: experienciaMatchedViaFor(String(r.id)),
+						}));
 
-						// Unión sin duplicar por empresa - orden de prioridad si la misma empresa
-						// aparece en más de una fuente: nombre (más específico/confiable) > catálogo
-						// viejo (describeMatch ya incluye sector/ciudad si corresponde) > taxonomía.
+						// Unión sin duplicar por empresa - orden de prioridad si la misma empresa aparece en
+						// más de una fuente: nombre (más específico/confiable) > catálogo viejo (describeMatch
+						// ya incluye sector/ciudad si corresponde) > certificación/sostenibilidad (match
+						// exacto o léxico curado, alta confianza) > taxonomía > experiencia (la fuente más
+						// aproximada de las 6 - texto libre idiosincrático, semántico como último recurso
+						// entre las nuevas).
 						const seen = new Set(taggedNameTypo.map((r) => r.id));
 						const fuzzyDeduped = taggedFuzzy.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
-						const merged = [...taggedNameTypo, ...fuzzyDeduped, ...taggedTaxonomy.filter((r) => !seen.has(r.id))];
+						const certificationDeduped = taggedCertification.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
+						const sustainabilityDeduped = taggedSustainability.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
+						const taxonomyDeduped = taggedTaxonomy.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
+						const experienciaDeduped = taggedExperiencia.filter((r) => !seen.has(r.id));
+						const merged = [
+							...taggedNameTypo,
+							...fuzzyDeduped,
+							...certificationDeduped,
+							...sustainabilityDeduped,
+							...taxonomyDeduped,
+							...experienciaDeduped,
+						];
 
 						if (merged.length > 0) {
 							return { content: [{ type: 'text' as const, text: JSON.stringify(merged, null, 2) }] };
