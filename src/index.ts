@@ -23,12 +23,14 @@ import { createMcpHandler } from 'agents/mcp/server';
 import { McpServer } from '@modelcontextprotocol/server';
 import { registerTaxonomyTools } from './taxonomy-tools';
 import { registerEmpresaTools } from './empresa-tools';
+import { registerIntentTools } from './intent-tools';
 
 export interface Env {
 	AI: Ai;
 	HYPERDRIVE: Hyperdrive;
 	EMBED_TOKEN: string;
 	MCP_TOKEN: string;
+	OPENAI_API_KEY: string;
 }
 
 interface EmbedRequestBody {
@@ -66,6 +68,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
 		const server = new McpServer({ name: 'perfilafiliados-taxonomy-mcp', version: '0.1.0' });
 		registerTaxonomyTools(server, env);
 		registerEmpresaTools(server, env);
+		registerIntentTools(server, env);
 
 		return server;
 	});

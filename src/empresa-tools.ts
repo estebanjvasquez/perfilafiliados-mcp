@@ -685,7 +685,10 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				'matchea ciudad o estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva ' +
 				'(con datos reales desde el 15 sep 2026, Fase 3/4 de taxonomía) - rara vez hace falta usarlo ' +
 				'porque "query" en texto libre ya encuentra esas categorías automáticamente; reservarlo para ' +
-				'cuando el usuario da un código CPV exacto o pide explícitamente navegar la taxonomía por código.',
+				'cuando el usuario da un código CPV exacto o pide explícitamente navegar la taxonomía por código. ' +
+				'Si antes llamaste a "resolve_search_intent" para esta misma consulta, pasá su resultado en ' +
+				'"resolvedPhrases" (ver ese parámetro) - si te devolvió una pregunta de aclaración, no llames a ' +
+				'esta tool todavía, respondé esa pregunta primero.',
 			inputSchema: {
 				query: z.string().min(2).optional().describe('Texto libre: nombre de empresa, servicio o sector'),
 				sector: z.string().optional().describe('Nombre (parcial) de uno de los 8 sectores institucionales, ej. "construccion"'),
@@ -716,9 +719,20 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							'tu JSON de salida) - úsala tal cual, no la repitas si no la tenés clara. Ayuda a la tool a no ' +
 							'confundir un término de negocio genérico con un intento de nombre de empresa.'
 					),
+				resolvedPhrases: z
+					.array(z.string())
+					.optional()
+					.describe(
+						'Solo si llamaste antes a resolve_search_intent para este mensaje: pasá acá tal cual su ' +
+							'"search_phrases" (una frase compuesta única, o varios conceptos independientes). Reemplaza ' +
+							'la descomposición automática en palabras sueltas para la búsqueda de taxonomía/experiencias, ' +
+							'evitando que una frase compuesta específica pierda prioridad frente a coincidencias genéricas ' +
+							'de una sola palabra. Si no llamaste a resolve_search_intent, omitilo - "query" solo sigue ' +
+							'funcionando igual que siempre.'
+					),
 			},
 		},
-		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, queryIntent }) => {
+		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, queryIntent, resolvedPhrases }) => {
 			if (!query && !sector && !ciudad && !categoria_codigo) {
 				return {
 					content: [
@@ -753,6 +767,24 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			// umbral, mas estricto.
 			const EXPERIENCIA_SEMANTIC_DISTANCE_THRESHOLD = 0.5;
 
+			// Fase MCP-6.1 (16 sep 2026) - bug real encontrado en vivo en producción DESPUES de publicar
+			// Fase MCP-6: "represas" volvió a colisionar con "REPRESENTACIONES..." - esta vez no via el
+			// nivel de tipeo de nombre (ya blindado en Fase MCP-5.4), sino via el nivel EXACTO mismo: la
+			// REGLA UNICA del prompt de n8n (pre-existente, no tocada hoy) le pide al modelo mandar la
+			// "raiz" de la palabra en "query" (ej. "perforaciones" -> "perforac"), y esa raiz no es
+			// determinista - esa vez el modelo trunco a "repres" (en vez de "represa" como en pruebas
+			// anteriores), y "repres" SI es substring literal de "representaciones" (ILIKE exacto real,
+			// no un falso positivo de similitud). El nivel EXACTO nunca tuvo esta proteccion porque
+			// siempre se documento como "ganador unico, cero riesgo, no tocar" - pero antes de esta fase
+			// no existia una alternativa mejor que ofrecerle. Ahora si: `resolvedPhrases` (cuando
+			// `resolve_search_intent` devolvio una unica frase compuesta) es la frase COMPLETA que el
+			// propio usuario/especialista valido, sin el truncamiento no-determinista de la REGLA UNICA -
+			// se usa esa frase para el chequeo de NOMBRE DE EMPRESA especificamente ("represas" no es
+			// substring de "representaciones"), dejando sin tocar el chequeo de servicio/sector (que sigue
+			// usando la raiz corta de `query` a proposito - ahi SI conviene, cataloga cerrado y chico,
+			// sin el riesgo de 406 nombres propios arbitrarios).
+			const nameMatchTerm = resolvedPhrases && resolvedPhrases.length === 1 ? resolvedPhrases[0] : query;
+
 			/** Arma el WHERE - `fuzzy=false` es el ILIKE exacto de siempre; `fuzzy=true` es el fallback por similitud. */
 			function buildConditions(fuzzy: boolean) {
 				const conditions = [sql`e.status_id = 1`];
@@ -774,7 +806,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 								)
 							)`
 							: sql`(
-								unaccent(e.name) ilike unaccent(${'%' + query + '%'})
+								unaccent(e.name) ilike unaccent(${'%' + nameMatchTerm + '%'})
 								or exists (
 									select 1 from empresa_sector_service ess
 									join services sv on sv.id = ess.service_id
@@ -912,7 +944,17 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					const semanticResolvedPromise: Promise<ResolvedConcept[]> = query
 						? (() => {
 								const servicePhrases = extractCandidatePhrases(query);
-								const taxonomyPhrases = extractCandidatePhrasesForTaxonomy(query);
+								// Fase MCP-6 (16 sep 2026): si `resolve_search_intent` ya interpretó la frase (una
+								// necesidad compuesta única, o varios conceptos independientes reales), esas frases
+								// reemplazan la descomposición mecánica SOLO para taxonomía/experiencia - es
+								// exactamente donde se diagnosticó el ruido de Fase MCP-5.5 ("perforación" suelta
+								// compitiendo con "tratamiento aguas"). El catálogo de SERVICIOS (112 frases cortas)
+								// NO se toca acá a propósito: sigue con su propia descomposición de siempre, porque
+								// embeber una frase larga completa como un solo vector es justo el "bug de dilución
+								// semántica" ya documentado más arriba para ese catálogo en particular - resolvedPhrases
+								// no está probado como seguro ahí todavía.
+								const taxonomyPhrases =
+									resolvedPhrases && resolvedPhrases.length > 0 ? resolvedPhrases : extractCandidatePhrasesForTaxonomy(query);
 								// Fase MCP-5.3: mismas frases candidatas que la taxonomía (misma lógica de
 								// descomposición aplica - la descomposición es una propiedad de la CONSULTA del
 								// usuario, no del catálogo contra el que se compara).
