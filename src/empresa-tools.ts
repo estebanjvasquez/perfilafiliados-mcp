@@ -497,9 +497,17 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						'Máximo de resultados (default 20, o 150 para el nivel EXACTO cuando la coincidencia es amplia - ' +
 							'ej. un sector institucional completo puede tener 100+ empresas reales, no es ruido a recortar)'
 					),
+				queryIntent: z
+					.enum(['SECTOR', 'SERVICE', 'COMPANY', 'RIF', 'CITY', 'MIXED'])
+					.optional()
+					.describe(
+						'La clasificación de intención que ya calculaste para este mensaje (mismo valor que ponés en ' +
+							'tu JSON de salida) - úsala tal cual, no la repitas si no la tenés clara. Ayuda a la tool a no ' +
+							'confundir un término de negocio genérico con un intento de nombre de empresa.'
+					),
 			},
 		},
-		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit }) => {
+		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, queryIntent }) => {
 			if (!query && !sector && !ciudad && !categoria_codigo) {
 				return {
 					content: [
@@ -713,8 +721,25 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					// terminado) - 0.65 deja margen real en vez de depender de un límite exacto. La
 					// longitud mínima 5 es una segunda barrera barata contra palabras cortas tipo
 					// "grua" (4 letras), independiente del score.
+					// FASE MCP-4.10 (16 sep 2026) - bug real: "represas" (sin coincidencia real en el
+					// catálogo - ni servicio, ni sector, ni categoría CPV para construcción/mantenimiento
+					// de represas) activaba igual este nivel y devolvía 6 empresas cuyo nombre empieza con
+					// "REPRESENTACIONES..." - la misma familia de colisión que "grua"~"GRUPO" (documentada
+					// arriba), pero esta vez el umbral 0.65 no alcanzaba a separarla porque "represa" y
+					// "representaciones" comparten un prefijo de 6 letras. Subir el umbral de nuevo habría
+					// sido el mismo parche reactivo de siempre - la causa real es que este nivel se aplica
+					// a CUALQUIER `query` de 5+ letras sin distinguir "esto podría ser un nombre de
+					// empresa" de "esto es un término de negocio genérico", pese a que el propio
+					// clasificador de CIRA YA calcula esa distinción (`queryIntent`) antes de llamar a la
+					// tool - solo que nunca se la pasábamos. Fix: `queryIntent` ahora es un parámetro
+					// opcional de la tool: el nivel de tipeo de nombre se salta cuando el clasificador ya
+					// identificó la consulta como SECTOR/SERVICE/CITY (un término de negocio, no un
+					// intento de nombre propio). Si el llamador no manda `queryIntent` (u otro cliente MCP
+					// distinto de CIRA), el nivel se sigue evaluando igual que antes - este parámetro solo
+					// puede EXCLUIR falsos positivos, nunca ocultar una empresa real que antes aparecía.
 					const NAME_TYPO_THRESHOLD = 0.65;
-					const nameTypoRowsPromise: Promise<EmpresaSearchRow[]> = query && query.length >= 5
+					const skipNameTypo = queryIntent === 'SECTOR' || queryIntent === 'SERVICE' || queryIntent === 'CITY';
+					const nameTypoRowsPromise: Promise<EmpresaSearchRow[]> = query && query.length >= 5 && !skipNameTypo
 						? sql<EmpresaSearchRow[]>`
 							${empresaSelectAndJoins(sql)}
 							where e.status_id = 1 and word_similarity(unaccent(${query}), unaccent(e.name)) > ${NAME_TYPO_THRESHOLD}
