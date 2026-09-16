@@ -12,9 +12,10 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *
  * Verificado contra Supabase real (11 sep 2026) antes de escribir esto:
  * - `empresa_taxonomy_category` (homologación empresa<->categoría CPV, Fase 3/4 del plan de
- *   taxonomía) sigue en 0 filas - el filtro `categoria_codigo`/`tipo_oferta` de `search_empresas`
- *   queda armado y funcional, pero no va a devolver nada hasta que esa homologación cargue datos.
- *   No bloquea el resto: `query`/`sector`/`ciudad` SÍ tienen datos reales hoy.
+ *   taxonomía) estaba en 0 filas al escribir esto - el filtro `categoria_codigo`/`tipo_oferta` de
+ *   `search_empresas` quedó armado y funcional para ese día. Tiene datos reales (756+ filas) desde
+ *   el 15 sep 2026 - ver el bloque fechado "Fase MCP-4.6" más abajo para el bug de cascada que hizo
+ *   falta corregir para que esos datos fueran alcanzables desde una búsqueda real.
  * - El sector/servicio real de cada empresa NO sale de `empresas.sector_principal_id` (está NULL
  *   en muchas filas, ej. las primeras empresas insertadas) sino de la tabla pivote
  *   `empresa_sector_service` (950 filas reales) -> `services` (112 filas) -> `services.sectors_id`
@@ -35,11 +36,33 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  * Postgres, a diferencia de MySQL, distingue tildes en ILIKE (bug real encontrado y corregido acá
  * y en `search_taxonomy` de Fase MCP-1 - ver ese archivo).
  *
- * `search_empresas` es HIBRIDO en 3 niveles, cada uno solo se activa si el anterior no devolvio
- * NADA (nunca cambia el resultado de una busqueda que ya funciona - mismo principio que el hibrido
- * lexico+semantico de `search_taxonomy`, Fase MCP-1):
+ * `search_empresas` es HIBRIDO en niveles, pensado para no cambiar el resultado de una busqueda que
+ * ya funciona (mismo principio que el hibrido lexico+semantico de `search_taxonomy`, Fase MCP-1) -
+ * PERO desde Fase MCP-4.6 (ver mas abajo) la taxonomia CPV nueva YA NO es un ultimo recurso
+ * exclusivo: se resuelve en PARALELO al nivel difuso, no despues de el.
  *
- * 1. EXACTO - `unaccent(columna) ilike unaccent(termino)` de siempre. `match_type: 'exact'`.
+ * 1. EXACTO - `unaccent(columna) ilike unaccent(termino)` de siempre. `match_type: 'exact'`. Si
+ *    esto encuentra algo, se devuelve tal cual - unico nivel que sigue "ganador unico" sin cambios.
+ *    Default de `limit` 150 (no 20 - ver "Fase MCP-4.9" mas abajo), porque acá mas resultados NUNCA
+ *    es ruido: es coincidencia literal.
+ *
+ * BUG REAL DE LIMITE ENCONTRADO EN VIVO (16 sep 2026, Fase MCP-4.9) - reportado por el usuario:
+ * "construccion" devolvía 20 empresas, la version anterior de CIRA (SQL libre, sin este limite)
+ * devolvía 72, y VINCCLER (que sí pertenece de verdad al sector CONSTRUCCIÓN - 5 servicios propios
+ * en ese sector, verificado contra la tabla real) no aparecía. Causa raíz: el nivel EXACTO
+ * reutilizaba el mismo `limit ?? 20` que los niveles aproximados (difuso/taxonomía/semántico),
+ * donde SÍ tiene sentido un tope bajo (más resultados ahí es más ruido, por diseño). Pero el nivel
+ * EXACTO no tiene ese problema - es ILIKE literal, cada fila es una coincidencia real, no una
+ * aproximación. Verificado contra Supabase real: "construccion" (nombre/servicio/sector) tiene 84
+ * empresas reales (más que las 72 de sector CONSTRUCCIÓN solo, porque también matchea nombre de
+ * empresa) - con `order by e.name limit 20`, VINCCLER (posición 79 de 84 alfabéticamente) y otras
+ * ~63 empresas reales quedaban cortadas sin ningún criterio de relevancia, solo por orden
+ * alfabético. El sector institucional más grande (SERVICIOS ASOCIADOS) tiene 114 empresas activas
+ * hoy - un límite de 20 nunca fue suficiente para una consulta de sector completo. Fix: el nivel
+ * EXACTO usa su propio default de 150 (`exactMax`, separado de `max`), y el techo del parámetro
+ * `limit` del schema sube de 50 a 200 - cubre con margen el sector más grande de hoy sin volverse
+ * "traer toda la tabla" (universo total: 406 empresas activas). Los demás niveles NO se tocaron -
+ * siguen en `max` (default 20), que es el comportamiento correcto para resultados aproximados.
  *
  * 2. DIFUSO (11 sep 2026, `pg_trgm`, YA estaba instalado en este proyecto de Supabase v1.6 - no
  *    hubo que habilitarlo) - tolera errores de tipeo: transposiciones/letras de mas o de menos
@@ -65,13 +88,22 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *    nombre con errores de tipeo es lo que ya hace `get_empresa` (comparacion 1-a-1 mas acotada,
  *    ahi si sigue aplicando word_similarity contra `e.name`).
  *
- * 3. SEMANTICO (rediseñado 12 sep 2026, Fase MCP-4.3 - la v1 del 11 sep embebia el `query`
+ * 3. TAXONOMIA CPV (léxico completo + semántico) - se resuelve SIEMPRE que el nivel EXACTO no
+ *    encontró nada, EN PARALELO con el nivel difuso de abajo, no como último recurso (Fase
+ *    MCP-4.6, ver el bloque fechado 15 sep 2026 mas abajo). Léxico: `unaccent(nombre/sinonimo)
+ *    ilike unaccent(query completo)` contra `taxonomy_categories` (`resolveLexicalTaxonomyMatches`).
+ *    Semantico: la parte `source: 'taxonomy'` del paso 4 de abajo. Sus empresas
+ *    (`empresa_taxonomy_category`) se UNEN (no reemplazan) a las del nivel difuso.
+ *
+ * 4. SEMANTICO (rediseñado 12 sep 2026, Fase MCP-4.3 - la v1 del 11 sep embebia el `query`
  *    COMPLETO como un solo vector; ver "Bug de dilucion semantica" mas abajo para por que se
  *    reemplazo) - inspirado en el approach hibrido de Mercadona Tech
  *    (https://newsletter.gemba.es/p/como-construimos-nuestro-buscador, se tomo SOLO la idea de
  *    hibrido lexico+semantico adaptada a nuestra escala real de cientos de empresas, no su stack
  *    de ranking con ML). Solo para el parametro `query` (`sector`/`ciudad` son vocabulario
- *    cerrado/geografico, no texto conceptual libre). 3 pasos:
+ *    cerrado/geografico, no texto conceptual libre). Desde Fase MCP-4.6, la fuente `taxonomy` de
+ *    este paso se usa arriba en el nivel 3 (paralelo al difuso) - lo que queda como ÚLTIMO recurso
+ *    acá es solo la fuente `service` (catálogo viejo). 3 pasos:
  *
  *    a) DESCOMPONER `query` en frases candidatas cortas (`extractCandidatePhrases`) - palabras
  *       significativas sueltas + bigramas de palabras adyacentes, quitando conectores/verbos de
@@ -83,15 +115,11 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *       uno - ver `extractEmbeddingVectors`), contra DOS catalogos con embedding propio:
  *       - `service_embeddings` (112 servicios + su sector, Fase MCP-4.2) - la fuente que
  *         encuentra empresas HOY, via el pivote `empresa_sector_service` ya poblado.
- *       - `taxonomy_category_embeddings` (3.483 nodos CPV, Fase MCP-1, ya generados y usados por
- *         `search_taxonomy`) - reusada tal cual, sin generar nada nuevo. Hoy NO encuentra ninguna
- *         empresa porque `empresa_taxonomy_category` (homologacion empresa<->categoria nueva,
- *         Fase 3/4 del proyecto de taxonomia) sigue en 0 filas - pero la consulta ya esta armada
- *         contra ella, asi que el dia que esa homologacion cargue datos, `search_empresas`
- *         empieza a encontrar mas empresas por esa via SIN tocar este codigo de nuevo. Esta es la
- *         parte "escalable para cuando las empresas agreguen sus servicios/productos de la
- *         taxonomia" que se pidio explicitamente - dos fuentes de concepto desde el dia uno, una
- *         ya usable y otra lista para cuando tenga datos.
+ *       - `taxonomy_category_embeddings` (3.483+ nodos CPV, Fase MCP-1, ya generados y usados por
+ *         `search_taxonomy`) - reusada tal cual, sin generar nada nuevo. `empresa_taxonomy_category`
+ *         tiene datos reales desde el 15 sep 2026 (Fase 3/4 del proyecto de taxonomia, 756+ filas) -
+ *         la fuente `taxonomy` de este paso encuentra empresas de verdad desde entonces, ver Fase
+ *         MCP-4.6 para el bug que hizo falta corregir para que esas empresas fueran alcanzables.
  *       Cada catalogo se resuelve en UNA query SQL (`UNION ALL` de un `ORDER BY <=> LIMIT 1` por
  *       frase, no N round-trips) - 2 queries totales sin importar cuantas frases haya. Umbral de
  *       distancia coseno 0.60 (igual que la v1, sigue calibrado contra los mismos casos reales).
@@ -126,6 +154,23 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *    conceptos unicos. La v2 de arriba resuelve esto de raiz (nunca embebe mas de un concepto por
  *    vector) en vez de parchear el umbral o pedirle al prompt que no combine terminos (fragil:
  *    dependeria de que el LLM nunca vuelva a hacerlo).
+ *
+ * BUG REAL DE CASCADA ENCONTRADO EN VIVO (15 sep 2026, Fase MCP-4.6) - reportado por el usuario tras
+ * cargar una empresa de prueba en el panel (Fase 4: buscador de autocarga) con categorías CPV
+ * nuevas ("Válvulas de Cabezal de Pozo API 6A" y sus hijas) pero SIN ningún servicio del catálogo
+ * viejo. Buscándola en CIRA con términos que coincidían exactamente con esas categorías, nunca
+ * aparecía - CIRA mostraba en cambio resultados "aproximados" de OTRAS empresas via el catálogo
+ * viejo. Causa raíz: la taxonomía (`empresa_taxonomy_category`) solo se consultaba en el nivel 3/4
+ * (semántico), que es el ÚLTIMO recurso - si el nivel difuso (2) encontraba CUALQUIER cosa en
+ * cualquier otra empresa del directorio (con 406 empresas reales, casi cualquier término de varias
+ * letras encuentra algo por `word_similarity`), la cascada se detenía ahí y la taxonomía nunca se
+ * llegaba a consultar. Una empresa que dependiera EXCLUSIVAMENTE de la taxonomía nueva (sin
+ * servicios viejos) era, en la práctica, invisible para CIRA sin importar qué tan bien coincidiera
+ * su categoría con la pregunta - defecto que anulaba el propósito completo de las Fases 3/4 del
+ * proyecto de taxonomía. Fix: la taxonomía (léxico completo del `query` + semántico) se resuelve
+ * en PARALELO al nivel difuso (`Promise.all`, sin round-trips extra secuenciales), y sus empresas
+ * se UNEN a las del difuso en vez de necesitar que el difuso fallara primero. El nivel EXACTO (1)
+ * no se tocó - sigue siendo un "ganador único" sin cambios, cero riesgo de regresión ahí.
  */
 
 /**
@@ -150,14 +195,18 @@ const SPANISH_STOPWORDS = new Set([
  * real de un usuario nunca necesita mas que eso, y cada frase extra es una fila mas al embedding
  * batch (barato, pero sin motivo para no acotarlo).
  */
-export function extractCandidatePhrases(text: string, maxPhrases = 8): string[] {
+function significantWords(text: string): string[] {
 	const normalized = text
 		.toLowerCase()
 		.normalize('NFD')
 		.replace(/[̀-ͯ]/g, '')
 		.replace(/[^a-z0-9\s]/g, ' ');
 
-	const words = normalized.split(/\s+/).filter((w) => w.length > 2 && !SPANISH_STOPWORDS.has(w));
+	return normalized.split(/\s+/).filter((w) => w.length > 2 && !SPANISH_STOPWORDS.has(w));
+}
+
+export function extractCandidatePhrases(text: string, maxPhrases = 8): string[] {
+	const words = significantWords(text);
 
 	if (words.length === 0) {
 		return [];
@@ -174,6 +223,36 @@ export function extractCandidatePhrases(text: string, maxPhrases = 8): string[] 
 	return Array.from(phrases).slice(0, maxPhrases);
 }
 
+/**
+ * Variante SOLO para el lado taxonomía (nunca para servicios - ver "bug de dilución semántica" mas
+ * abajo en este archivo): además de palabras sueltas y bigramas, agrega la SECUENCIA COMPLETA de
+ * palabras significativas cuando son pocas (2 a 5) - las categorías CPV suelen tener nombres
+ * compuestos de 3+ palabras (ej. "Válvulas de Cabezal de Pozo API 6A"), y un usuario que describe
+ * exactamente eso con 3 palabras clave necesita esas 3 juntas para resolver bien, no de a pares.
+ *
+ * Encontrado en vivo (Fase MCP-4.6, 15 sep 2026) probando una empresa cargada con esa categoría
+ * exacta vía el buscador de autocarga del panel: "valvula cabezal pozo" como frase COMPLETA
+ * resuelve a "Válvulas de Cabezal de Pozo API 6A" (distancia 0.4519) como el MEJOR match de los
+ * 3.497 nodos - ni la palabra "cabezal" sola (ni siquiera entre los 8 más cercanos) ni el bigrama
+ * "cabezal pozo" (resuelve a nodos temáticamente cercanos pero no al correcto) lo encontraban.
+ *
+ * No se aplica al catálogo de servicios: sus 112 nombres ya son cortos y específicos (no hace
+ * falta), y el riesgo de reintroducir el bug de dilución semántica (2 CONCEPTOS DISTINTOS
+ * combinados en un solo vector, ej. "soldadura tuberia") es real ahí. Acá el riesgo es menor porque
+ * los nombres CPV son compuestos por diseño (un solo concepto con varias palabras), no una oración
+ * con conectores mezclando 2 pedidos distintos.
+ */
+export function extractCandidatePhrasesForTaxonomy(text: string, maxPhrases = 8): string[] {
+	const words = significantWords(text);
+	const phrases = new Set(extractCandidatePhrases(text, maxPhrases));
+
+	if (words.length >= 3 && words.length <= 5) {
+		phrases.add(words.join(' '));
+	}
+
+	return Array.from(phrases).slice(0, maxPhrases + 1);
+}
+
 type ResolvedConcept = {
 	source: 'service' | 'taxonomy';
 	id: number;
@@ -182,58 +261,170 @@ type ResolvedConcept = {
 	distance: number;
 };
 
+type LexicalTaxonomyMatch = { id: number; name: string };
+
+/**
+ * Familias CPV "agujero negro" - nombre lo bastante genérico como para atraer coincidencias léxicas
+ * o semánticas sin relación temática real. Mismo problema, mismo criterio de exclusión puntual por
+ * código (no un umbral, no excluir todo un nivel) ya usado en `HomologateServicesTaxonomy.php`
+ * (Fase 3, Laravel) para `CPV-29.02`/`CPV-12.04` - acá se replica esa misma lista porque el
+ * problema es el MISMO dato (`taxonomy_category_embeddings`), solo que consultado desde otro
+ * lugar. `CPV-48.02` "Accesorios" (Grupo 48, Textil/Cuero/Confección) sumado acá el 15 sep 2026,
+ * Fase MCP-4.6: 15 empresas reales quedaron vinculadas a esa Familia por la homologación automática
+ * de Fase 3, y su embedding cae dentro del umbral para la palabra suelta "cabezal" sin relación
+ * temática real (textil vs. pozos petroleros) - encontrado en vivo probando el fix de esta fase,
+ * exactamente el mismo síntoma que motivó excluir las 2 familias anteriores.
+ */
+const GENERIC_ATTRACTOR_FAMILY_CODES = ['CPV-29.02', 'CPV-12.04', 'CPV-48.02'];
+
+/**
+ * Forma exacta de las filas de `empresaSelectAndJoins()` - anotada explícita (mismo criterio que
+ * ya usa `resolveSemanticConcepts` para sus propias queries) porque sin esto TypeScript no infería
+ * bien el tipo de fila de `sql\`...\`` cuando la query se declaraba como promesa suelta antes de un
+ * `Promise.all` en vez de un `await` directo - encontrado compilando el fix de Fase MCP-4.6.
+ */
+type EmpresaSearchRow = {
+	id: number;
+	rif: string;
+	name: string;
+	phone: string | null;
+	website: string | null;
+	street: string | null;
+	ano_fund: number | null;
+	city_name: string | null;
+	state_name: string | null;
+	country_name: string | null;
+	sectores: string | null;
+	servicios: string | null;
+};
+
+/**
+ * Match léxico DIRECTO de `query` completo contra nombre/sinónimo de una categoría CPV (nivel
+ * Familia u hoja, nunca Grupo) - mismo criterio que el nivel léxico de `search_taxonomy` (Fase
+ * MCP-1), pero acá contra la frase COMPLETA que mandó el agente, no descompuesta en frases cortas
+ * (a diferencia de `resolveSemanticConcepts`, que sí descompone para el embedding). Sirve para el
+ * caso real que motivó Fase MCP-4.6 abajo: una empresa cargó la categoría "Válvulas de Cabezal de
+ * Pozo API 6A" vía el buscador de autocarga (Fase 4 del panel) - un usuario de CIRA preguntando
+ * literalmente por "válvulas de cabezal de pozo" matchea esto por ILIKE simple, sin necesitar el
+ * modelo de embeddings para un caso que ya es casi idéntico en texto.
+ */
+async function resolveLexicalTaxonomyMatches(sql: ReturnType<typeof getSql>, query: string): Promise<LexicalTaxonomyMatch[]> {
+	const rows = await sql<{ id: number; name: string }[]>`
+		select distinct on (tc.id) tc.id, coalesce(tt.name, tc.code) as name
+		from taxonomy_categories tc
+		left join taxonomy_category_translations tt on tt.category_id = tc.id and tt.locale = 'es'
+		left join taxonomy_category_translations tt_en on tt_en.category_id = tc.id and tt_en.locale = 'en'
+		left join taxonomy_category_synonyms syn on syn.category_id = tc.id
+		where tc.level != 0 and tc.is_active = true
+			and tc.code not in ${sql(GENERIC_ATTRACTOR_FAMILY_CODES)}
+			and (
+				unaccent(coalesce(tt.name, '')) ilike unaccent(${'%' + query + '%'})
+				or unaccent(coalesce(tt_en.name, '')) ilike unaccent(${'%' + query + '%'})
+				or unaccent(coalesce(syn.term, '')) ilike unaccent(${'%' + query + '%'})
+			)
+		limit 10
+	`;
+
+	return rows;
+}
+
 /**
  * Resuelve cada frase candidata contra `service_embeddings` y `taxonomy_category_embeddings` -
  * UNA query SQL por catalogo (UNION ALL de un nearest-neighbor por frase), sin importar cuantas
  * frases haya. Devuelve los conceptos que pasan el umbral, deduplicados por (fuente, id) quedando
  * con la mejor (menor) distancia si una misma fila fue la mas cercana para mas de una frase.
+ *
+ * 2 correcciones reales encontradas probando el fix de Fase MCP-4.6 en vivo (15 sep 2026):
+ *
+ * 1. `service_embeddings` incluye TODOS los 112 servicios sin excepción (`GenerateServiceEmbeddings.php`
+ *    nunca excluyó los placeholders "X"/"OTROS" del catálogo viejo, a diferencia de la homologación
+ *    de Fase 3 que sí los excluye) - su texto embebido es "X | Sector: <sector>", así que un
+ *    servicio "X" queda semánticamente cerca de CUALQUIER término relacionado con su sector (ej.
+ *    "cabezal"/"pozo" -> cerca de "X | Sector: SERVICIOS A POZOS"). Verificado en vivo: buscar
+ *    "válvulas de cabezal de pozo" devolvía 20 empresas, TODAS con `matched_via: similar a "cabezal"
+ *    (servicio: X)` - ninguna coincidencia real. Se excluyen acá (no en Laravel, para no tener que
+ *    regenerar embeddings) con `sv.name not in ('X','OTROS')`.
+ *
+ * 2. Tomar el nearest-neighbor ÚNICO (`limit 1`) por frase funciona bien contra el catálogo de 112
+ *    servicios (poco denso), pero la taxonomía CPV tiene 3.497+ nodos - varios muy próximos entre sí
+ *    temáticamente (ej. "Cabezal de Inyección", "Cabezal de Escape" y "Válvulas de Cabezal de Pozo"
+ *    conviven cerca). Con `limit 1`, una palabra como "cabezal" resolvía al nodo más cercano
+ *    cualquiera (no necesariamente el correcto para lo que la empresa cargó), y si NINGUNA empresa
+ *    estaba vinculada a ESE nodo puntual, la taxonomía nueva de Fase MCP-4.6 igual no encontraba
+ *    nada - cayendo al fallback de servicio del punto 1. Fix: la taxonomía toma los 5 más cercanos
+ *    por frase (no 1), todos los que pasen el umbral - le da a la categoría realmente vinculada una
+ *    chance real de aparecer sin tener que ser la campeona absoluta de un espacio mucho más denso.
+ *    El catálogo de servicios se deja en `limit 1` sin cambios (ya calibrado, sin evidencia de que
+ *    haga falta ensancharlo, y ensancharlo sin necesidad sería solo un riesgo más).
  */
 async function resolveSemanticConcepts(
 	sql: ReturnType<typeof getSql>,
 	env: Env,
-	phrases: string[],
+	servicePhrases: string[],
+	taxonomyPhrases: string[],
 	threshold: number
 ): Promise<ResolvedConcept[]> {
-	const embeddingResult = await env.AI.run('@cf/baai/bge-m3', { text: phrases });
-	const vectors = extractEmbeddingVectors(embeddingResult);
+	// UNA sola llamada al modelo para las frases de AMBOS catálogos (aunque sean listas distintas -
+	// ver docblock de `extractCandidatePhrasesForTaxonomy`) - se embebe la unión sin duplicados, y
+	// cada catálogo busca su vector por texto en el mapa resultante.
+	const allPhrases = Array.from(new Set([...servicePhrases, ...taxonomyPhrases]));
 
-	const usable = phrases.map((phrase, i) => ({ phrase, vector: vectors[i] })).filter((p): p is { phrase: string; vector: string } => !!p.vector);
-
-	if (usable.length === 0) {
+	if (allPhrases.length === 0) {
 		return [];
 	}
 
-	const serviceParts = usable.map(
+	const embeddingResult = await env.AI.run('@cf/baai/bge-m3', { text: allPhrases });
+	const vectors = extractEmbeddingVectors(embeddingResult);
+	const vectorByPhrase = new Map(allPhrases.map((phrase, i) => [phrase, vectors[i]]));
+
+	const usableService = servicePhrases
+		.map((phrase) => ({ phrase, vector: vectorByPhrase.get(phrase) }))
+		.filter((p): p is { phrase: string; vector: string } => !!p.vector);
+	const usableTaxonomy = taxonomyPhrases
+		.map((phrase) => ({ phrase, vector: vectorByPhrase.get(phrase) }))
+		.filter((p): p is { phrase: string; vector: string } => !!p.vector);
+
+	if (usableService.length === 0 && usableTaxonomy.length === 0) {
+		return [];
+	}
+
+	const serviceParts = usableService.map(
 		({ vector }, i) => sql`(
 			select ${i}::int as phrase_idx, sv.id, sv.name, (se.embedding <=> ${vector}::vector) as distance
 			from service_embeddings se
 			join services sv on sv.id = se.service_id
+			where upper(sv.name) not in ('X', 'OTROS')
 			order by se.embedding <=> ${vector}::vector asc
 			limit 1
 		)`
 	);
-	const taxonomyParts = usable.map(
+	const taxonomyParts = usableTaxonomy.map(
 		({ vector }, i) => sql`(
 			select ${i}::int as phrase_idx, tc.id, coalesce(tt.name, tc.code) as name, (tce.embedding <=> ${vector}::vector) as distance
 			from taxonomy_category_embeddings tce
 			join taxonomy_categories tc on tc.id = tce.category_id
 			left join taxonomy_category_translations tt on tt.category_id = tc.id and tt.locale = 'es'
+			where tc.code not in ${sql(GENERIC_ATTRACTOR_FAMILY_CODES)}
 			order by tce.embedding <=> ${vector}::vector asc
-			limit 1
+			limit 5
 		)`
 	);
 
 	const [serviceMatches, taxonomyMatches] = await Promise.all([
-		sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${serviceParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`,
-		sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${taxonomyParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`,
+		serviceParts.length > 0
+			? sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${serviceParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`
+			: Promise.resolve([]),
+		taxonomyParts.length > 0
+			? sql<{ phrase_idx: number; id: number; name: string; distance: number }[]>`${taxonomyParts.reduce((acc, p) => sql`${acc} union all ${p}`)}`
+			: Promise.resolve([]),
 	]);
 
 	const resolved: ResolvedConcept[] = [];
 	for (const m of serviceMatches) {
-		if (m.distance < threshold) resolved.push({ source: 'service', id: m.id, name: m.name, phrase: usable[m.phrase_idx].phrase, distance: m.distance });
+		if (m.distance < threshold) resolved.push({ source: 'service', id: m.id, name: m.name, phrase: usableService[m.phrase_idx].phrase, distance: m.distance });
 	}
 	for (const m of taxonomyMatches) {
-		if (m.distance < threshold) resolved.push({ source: 'taxonomy', id: m.id, name: m.name, phrase: usable[m.phrase_idx].phrase, distance: m.distance });
+		if (m.distance < threshold) resolved.push({ source: 'taxonomy', id: m.id, name: m.name, phrase: usableTaxonomy[m.phrase_idx].phrase, distance: m.distance });
 	}
 
 	const bestByKey = new Map<string, ResolvedConcept>();
@@ -280,9 +471,10 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				'Busca empresas afiliadas a la Cámara Petrolera de Venezuela. Requiere al menos un filtro ' +
 				'(query, sector, ciudad o categoria_codigo) - no permite listar todas las empresas sin filtrar. ' +
 				'"query" busca por nombre de empresa, servicio o sector en texto libre. "ciudad" matchea ciudad o ' +
-				'estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva, pero esa homologación ' +
-				'todavía no tiene datos cargados (Fase 3/4 del proyecto de taxonomía), así que hoy puede no ' +
-				'devolver nada - usar query/sector/ciudad mientras tanto.',
+				'estado venezolano. "categoria_codigo" filtra por la taxonomía CPV nueva (con datos reales desde ' +
+				'el 15 sep 2026, Fase 3/4 de taxonomía) - rara vez hace falta usarlo porque "query" en texto ' +
+				'libre ya encuentra esas categorías automáticamente; reservarlo para cuando el usuario da un ' +
+				'código CPV exacto o pide explícitamente navegar la taxonomía por código.',
 			inputSchema: {
 				query: z.string().min(2).optional().describe('Texto libre: nombre de empresa, servicio o sector'),
 				sector: z.string().optional().describe('Nombre (parcial) de uno de los 8 sectores institucionales, ej. "construccion"'),
@@ -290,12 +482,21 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				categoria_codigo: z
 					.string()
 					.optional()
-					.describe('Código CPV (prefijo, ej. "CPV-05") de la taxonomía nueva - sin datos reales todavía, ver descripción'),
+					.describe('Código CPV (prefijo, ej. "CPV-05") de la taxonomía nueva - con datos reales desde el 15 sep 2026'),
 				tipo_oferta: z
 					.string()
 					.optional()
 					.describe('Filtra además por tipo de oferta de la categoría CPV - solo aplica junto con categoria_codigo'),
-				limit: z.number().int().min(1).max(50).optional().describe('Máximo de resultados (default 20)'),
+				limit: z
+					.number()
+					.int()
+					.min(1)
+					.max(200)
+					.optional()
+					.describe(
+						'Máximo de resultados (default 20, o 150 para el nivel EXACTO cuando la coincidencia es amplia - ' +
+							'ej. un sector institucional completo puede tener 100+ empresas reales, no es ruido a recortar)'
+					),
 			},
 		},
 		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit }) => {
@@ -418,11 +619,21 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			}
 
 			try {
+				// El nivel EXACTO usa un default MAS ALTO que el resto (150, no 20) - ver docblock del
+				// archivo, bloque fechado "Fase MCP-4.9". Un ILIKE exacto contra sector/servicio/nombre
+				// nunca es "ruido": una consulta que coincide con un sector institucional completo puede
+				// legitimamente tener 100+ empresas reales (ej. "construccion" -> 84, "SERVICIOS
+				// ASOCIADOS" tiene 114 empresas activas) - recortar a 20 con `order by e.name` no reduce
+				// ruido, descarta resultados reales por orden alfabetico (una empresa como "VINCCLER",
+				// bien atras en el alfabeto, quedaba afuera pese a pertenecer genuinamente al sector).
+				// Los demas niveles (difuso/taxonomia/tipeo/semantico) SI necesitan quedarse en el
+				// default bajo (20) - ahi mas resultados SI es mas ruido, por diseño (ver docblock).
+				const exactMax = limit ?? 150;
 				const exactRows = await sql`
 					${empresaSelectAndJoins(sql)}
 					where ${buildConditions(false)}
 					order by e.name
-					limit ${max}
+					limit ${exactMax}
 				`;
 
 				if (exactRows.length > 0) {
@@ -431,90 +642,195 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 				}
 
-				// Nivel 2 (difuso) y 3 (semantico) solo tienen sentido si el usuario dio texto libre
-				// para tolerar (categoria_codigo es un codigo exacto, no aplica a ninguno de los 2).
-				// Nunca se activan si el ILIKE ya encontro algo - mismo principio que el hibrido de
-				// `search_taxonomy` (lexico primero, semantico solo de respaldo).
+				// Nivel 2 (difuso), taxonomía y nivel 3 (semántico por servicio) solo tienen sentido
+				// si el usuario dio texto libre para tolerar (categoria_codigo es un código exacto,
+				// no aplica a ninguno). Todos abajo solo se evalúan cuando el ILIKE exacto NO
+				// encontró nada - eso sí se mantiene igual que siempre (barato, cubre la mayoría de
+				// los casos ya verificados en la batería de regresión de Fase MCP-4.5).
+				//
+				// FASE MCP-4.6 (15 sep 2026) - bug real encontrado por el usuario probando una
+				// empresa de prueba cargada SOLO con categorías de la taxonomía nueva (sin ningún
+				// servicio del catálogo viejo, vía el buscador de autocarga del panel, Fase 4): esa
+				// empresa NUNCA podía aparecer en CIRA, para NINGUNA búsqueda, mientras el catálogo
+				// VIEJO tuviera aunque sea una coincidencia floja en OTRA empresa cualquiera del
+				// directorio - porque antes la taxonomía (`empresa_taxonomy_category`) solo se
+				// consultaba como nivel 3, y el nivel 2 (difuso) cortaba la cascada apenas
+				// encontraba algo, sin importar qué tan bueno fuera ese algo. Con 406 empresas reales,
+				// el nivel difuso casi siempre encuentra ALGO para cualquier término de varias
+				// letras - la taxonomía nueva quedaba efectivamente inalcanzable desde CIRA pese a
+				// tener datos reales (las 756 filas de Fase 3 + lo que cargue Fase 4). Fix: la
+				// taxonomía (léxico completo + semántico) se resuelve en PARALELO al nivel difuso,
+				// no después - se devuelven las empresas de AMBAS fuentes juntas, nunca se deja que
+				// el catálogo viejo silencie a la taxonomía nueva.
 				if (query || sector || ciudad) {
-					const fuzzyRows = await sql`
+					// Cada promesa se declara ANTES de esperar ninguna (no todas juntas dentro de un
+					// solo array literal de `Promise.all`) - encontrado necesario acá: TypeScript
+					// perdía el tipo de fila real de `sql` cuando la query iba como elemento de un
+					// array mixto con otras promesas, dejando `fuzzyRows`/`taxonomyRows` sin `.id` ni
+					// el resto de columnas al compilar. Declarar cada una por separado y esperarlas
+					// juntas con `Promise.all` da la misma concurrencia real sin ese problema de tipos.
+					const fuzzyRowsPromise = sql<EmpresaSearchRow[]>`
 						${empresaSelectAndJoins(sql)}
 						where ${buildConditions(true)}
 						order by e.name
 						limit ${max}
 					`;
-
-					if (fuzzyRows.length > 0) {
-						const matchedVia = describeMatch('fuzzy');
-						const tagged = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: matchedVia }));
-						return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
-					}
-				}
-
-				// Nivel 3: semantico, solo para `query` (sector/ciudad son vocabulario cerrado/
-				// geografico, no texto conceptual libre) - ver docblock de arriba para el diseno v2
-				// (descomposicion en frases + 2 fuentes de concepto + union, en vez de un solo
-				// embedding del query completo contra un solo catalogo).
-				if (query) {
-					const phrases = extractCandidatePhrases(query);
-					const resolved = phrases.length > 0 ? await resolveSemanticConcepts(sql, env, phrases, SEMANTIC_DISTANCE_THRESHOLD) : [];
-
-					if (resolved.length > 0) {
-						const serviceIds = resolved.filter((r) => r.source === 'service').map((r) => r.id);
-						const taxonomyIds = resolved.filter((r) => r.source === 'taxonomy').map((r) => r.id);
-
-						const semanticRows = await sql`
+					const lexicalTaxonomyPromise: Promise<LexicalTaxonomyMatch[]> = query
+						? resolveLexicalTaxonomyMatches(sql, query)
+						: Promise.resolve([]);
+					const semanticResolvedPromise: Promise<ResolvedConcept[]> = query
+						? (() => {
+								const servicePhrases = extractCandidatePhrases(query);
+								const taxonomyPhrases = extractCandidatePhrasesForTaxonomy(query);
+								return servicePhrases.length > 0 || taxonomyPhrases.length > 0
+									? resolveSemanticConcepts(sql, env, servicePhrases, taxonomyPhrases, SEMANTIC_DISTANCE_THRESHOLD)
+									: Promise.resolve([]);
+							})()
+						: Promise.resolve([]);
+					// FASE MCP-4.7 (15 sep 2026) - bug real: "Vincler" (typo de "VINCCLER", la empresa
+					// real) sin sufijo legal ni frase de "dame información sobre..." hace que el
+					// clasificador de intención de CIRA lo mande a `search_empresas` en vez de
+					// `get_empresa` (que SÍ tiene esta misma tolerancia a tipeos, pero contra el
+					// nombre - ver esa tool más abajo). Sin este nivel acá, `search_empresas` NUNCA
+					// intenta de nuevo por nombre con tipos si el ILIKE exacto falla (el difuso de
+					// arriba compara solo servicio/sector, nunca `e.name` - a propósito, ver docblock
+					// del archivo) y termina devolviendo ruido semántico sin relación real (verificado
+					// en vivo: "vincler" resolvía a "TORNILLERÍA" por pura coincidencia de embedding,
+					// 4 empresas ajenas).
+					//
+					// UMBRAL 0.7 (no el 0.5 de `get_empresa`) + longitud mínima 5 - encontrado en vivo
+					// que 0.5 (el de `get_empresa`) es SEGURO ahí porque esa tool ya asume una
+					// intención de "buscar ESTA empresa puntual", pero acá en `search_empresas` (que
+					// recibe términos de negocio genéricos todo el tiempo) 0.5 reintroduce EXACTAMENTE
+					// la colisión ya documentada arriba: "grua" (hueco real del catálogo, nunca debe
+					// dar respuesta) dio 0.6 de similitud contra CUALQUIER nombre con "GRUPO" ("GRUPO
+					// PROMARGON", "GRUPO SISEVENCA", etc. - 8 empresas ajenas, regresión real
+					// encontrada probando este mismo fix). "vincler"~"VINCCLER" da 0.70, sin ningún
+					// competidor cercano (el siguiente candidato real queda en 0.25) - 0.65 separa
+					// limpio los 2 casos verificados. Nota: "vincler"~"VINCCLER" da EXACTAMENTE 0.7 -
+					// probado en vivo con el umbral en 0.7 y `>` estricto, quedó afuera por ese
+					// límite exacto (bug real de este mismo fix, encontrado antes de darlo por
+					// terminado) - 0.65 deja margen real en vez de depender de un límite exacto. La
+					// longitud mínima 5 es una segunda barrera barata contra palabras cortas tipo
+					// "grua" (4 letras), independiente del score.
+					const NAME_TYPO_THRESHOLD = 0.65;
+					const nameTypoRowsPromise: Promise<EmpresaSearchRow[]> = query && query.length >= 5
+						? sql<EmpresaSearchRow[]>`
 							${empresaSelectAndJoins(sql)}
-							where e.status_id = 1 and (
-								${serviceIds.length > 0 ? sql`exists (select 1 from empresa_sector_service ess where ess.empresa_id = e.id and ess.service_id in ${sql(serviceIds)})` : sql`false`}
-								or
-								${taxonomyIds.length > 0 ? sql`exists (select 1 from empresa_taxonomy_category etc where etc.empresa_id = e.id and etc.category_id in ${sql(taxonomyIds)})` : sql`false`}
-							)
+							where e.status_id = 1 and word_similarity(unaccent(${query}), unaccent(e.name)) > ${NAME_TYPO_THRESHOLD}
 							order by e.name
 							limit ${max}
-						`;
+						`
+						: Promise.resolve([]);
 
-						if (semanticRows.length > 0) {
-							// Para explicar CADA fila (no dejar que se preste a confusion): que concepto
-							// resuelto es el que realmente la trajo. 2 lookups baratos (acotados a los
-							// pocos ids de `resolved`, no a todo el directorio) en vez de N+1 por fila.
-							const [serviceLinks, taxonomyLinks] = await Promise.all([
-								serviceIds.length > 0
-									? sql<{ empresa_id: number; service_id: number }[]>`select empresa_id, service_id from empresa_sector_service where service_id in ${sql(serviceIds)}`
-									: Promise.resolve([] as { empresa_id: number; service_id: number }[]),
-								taxonomyIds.length > 0
-									? sql<{ empresa_id: number; category_id: number }[]>`select empresa_id, category_id from empresa_taxonomy_category where category_id in ${sql(taxonomyIds)}`
-									: Promise.resolve([] as { empresa_id: number; category_id: number }[]),
-							]);
+					const [fuzzyRows, lexicalTaxonomy, semanticResolved, nameTypoRows] = await Promise.all([
+						fuzzyRowsPromise,
+						lexicalTaxonomyPromise,
+						semanticResolvedPromise,
+						nameTypoRowsPromise,
+					]);
 
-							const bestByKey = new Map(resolved.map((r) => [`${r.source}:${r.id}`, r]));
+					const semanticTaxonomy = semanticResolved.filter((r) => r.source === 'taxonomy');
+					const taxonomyIds = Array.from(new Set([...lexicalTaxonomy.map((r) => r.id), ...semanticTaxonomy.map((r) => r.id)]));
 
-							// postgres.js devuelve columnas bigint como STRING (evita perder precision) - comparar
-							// con `!==` estricto contra un Number, como se hacia antes, nunca matchea ("88" !== 88)
-							// y esta funcion siempre caia al texto generico de abajo (bug real encontrado al
-							// verificar en vivo: toda fila semantica mostraba "similar por servicio o categoria
-							// relacionada" en vez del concepto real). Fix: normalizar ambos lados con String().
-							function matchedViaFor(empresaId: string): string {
-								let best: ResolvedConcept | null = null;
-								for (const link of serviceLinks) {
-									if (String(link.empresa_id) !== empresaId) continue;
-									const r = bestByKey.get(`service:${link.service_id}`);
-									if (r && (!best || r.distance < best.distance)) best = r;
-								}
-								for (const link of taxonomyLinks) {
-									if (String(link.empresa_id) !== empresaId) continue;
-									const r = bestByKey.get(`taxonomy:${link.category_id}`);
-									if (r && (!best || r.distance < best.distance)) best = r;
-								}
-								if (!best) return 'similar por servicio o categoría relacionada';
-								return `similar a "${best.phrase}" (${best.source === 'service' ? 'servicio' : 'categoría'}: ${best.name})`;
+					const taxonomyRows =
+						taxonomyIds.length > 0
+							? await sql<EmpresaSearchRow[]>`
+								${empresaSelectAndJoins(sql)}
+								where e.status_id = 1
+									and exists (select 1 from empresa_taxonomy_category etc where etc.empresa_id = e.id and etc.category_id in ${sql(taxonomyIds)})
+								order by e.name
+								limit ${max}
+							`
+							: ([] as EmpresaSearchRow[]);
+
+					if (nameTypoRows.length > 0 || fuzzyRows.length > 0 || taxonomyRows.length > 0) {
+						const nameTypoMatchedVia = `similar a "${query}" (nombre de empresa, posible diferencia de tipeo)`;
+						const fuzzyMatchedVia = describeMatch('fuzzy');
+						const lexicalByCategoryId = new Map(lexicalTaxonomy.map((r) => [r.id, r]));
+						const semanticByCategoryId = new Map(semanticTaxonomy.map((r) => [r.id, r]));
+
+						// Igual que en el nivel semántico de más abajo: acotado a los pocos ids
+						// resueltos, no a todo el directorio.
+						const taxonomyLinks =
+							taxonomyIds.length > 0
+								? await sql<{ empresa_id: number; category_id: number }[]>`
+									select empresa_id, category_id from empresa_taxonomy_category where category_id in ${sql(taxonomyIds)}
+								`
+								: [];
+
+						function taxonomyMatchedViaFor(empresaId: string): string {
+							const categoryIds = taxonomyLinks.filter((l) => String(l.empresa_id) === empresaId).map((l) => l.category_id);
+							for (const id of categoryIds) {
+								const lex = lexicalByCategoryId.get(id);
+								if (lex) return `coincide con "${query}" (categoría CPV: ${lex.name})`;
 							}
+							for (const id of categoryIds) {
+								const sem = semanticByCategoryId.get(id);
+								if (sem) return `similar a "${sem.phrase}" (categoría CPV: ${sem.name})`;
+							}
+							return 'coincide con la taxonomía CPV';
+						}
 
-							const tagged = semanticRows.map((r) => ({
-								...r,
-								match_type: 'semantic' as const,
-								matched_via: matchedViaFor(String(r.id)),
-							}));
-							return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+						const taggedNameTypo = nameTypoRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: nameTypoMatchedVia }));
+						const taggedFuzzy = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: fuzzyMatchedVia }));
+						const taggedTaxonomy = taxonomyRows.map((r) => ({
+							...r,
+							match_type: 'taxonomy' as const,
+							matched_via: taxonomyMatchedViaFor(String(r.id)),
+						}));
+
+						// Unión sin duplicar por empresa - orden de prioridad si la misma empresa
+						// aparece en más de una fuente: nombre (más específico/confiable) > catálogo
+						// viejo (describeMatch ya incluye sector/ciudad si corresponde) > taxonomía.
+						const seen = new Set(taggedNameTypo.map((r) => r.id));
+						const fuzzyDeduped = taggedFuzzy.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
+						const merged = [...taggedNameTypo, ...fuzzyDeduped, ...taggedTaxonomy.filter((r) => !seen.has(r.id))];
+
+						if (merged.length > 0) {
+							return { content: [{ type: 'text' as const, text: JSON.stringify(merged, null, 2) }] };
+						}
+					}
+
+					// Último recurso: semántico por SERVICIO viejo únicamente (la taxonomía ya se
+					// evaluó arriba y no encontró nada) - mismo criterio que ya existía, sin cambios
+					// de comportamiento para este caso (ej. "necesito quien me suelde tuberias").
+					if (query) {
+						const serviceIds = semanticResolved.filter((r) => r.source === 'service').map((r) => r.id);
+
+						if (serviceIds.length > 0) {
+							const semanticRows = await sql`
+								${empresaSelectAndJoins(sql)}
+								where e.status_id = 1
+									and exists (select 1 from empresa_sector_service ess where ess.empresa_id = e.id and ess.service_id in ${sql(serviceIds)})
+								order by e.name
+								limit ${max}
+							`;
+
+							if (semanticRows.length > 0) {
+								const bestByServiceId = new Map(semanticResolved.filter((r) => r.source === 'service').map((r) => [r.id, r]));
+								const serviceLinks = await sql<{ empresa_id: number; service_id: number }[]>`
+									select empresa_id, service_id from empresa_sector_service where service_id in ${sql(serviceIds)}
+								`;
+
+								function serviceMatchedViaFor(empresaId: string): string {
+									let best: ResolvedConcept | null = null;
+									for (const link of serviceLinks) {
+										if (String(link.empresa_id) !== empresaId) continue;
+										const r = bestByServiceId.get(link.service_id);
+										if (r && (!best || r.distance < best.distance)) best = r;
+									}
+									if (!best) return 'similar por servicio relacionado';
+									return `similar a "${best.phrase}" (servicio: ${best.name})`;
+								}
+
+								const tagged = semanticRows.map((r) => ({
+									...r,
+									match_type: 'semantic' as const,
+									matched_via: serviceMatchedViaFor(String(r.id)),
+								}));
+								return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+							}
 						}
 					}
 				}
