@@ -401,6 +401,16 @@ function truncateText(text: string, max = 100): string {
 }
 
 /**
+ * Fase MCP-5.5 - cantidad de palabras significativas de una frase, usada como desempate de
+ * "qué tan específica" es una coincidencia (ver el merge final de `search_empresas`). Reusa
+ * `significantWords` (la misma función que arma las frases candidatas del nivel semántico) para
+ * que el criterio de "palabra significativa" sea uno solo en todo el archivo.
+ */
+function phraseSpecificity(phrase: string): number {
+	return significantWords(phrase).length;
+}
+
+/**
  * Familias CPV "agujero negro" - nombre lo bastante genérico como para atraer coincidencias léxicas
  * o semánticas sin relación temática real. Mismo problema, mismo criterio de exclusión puntual por
  * código (no un umbral, no excluir todo un nivel) ya usado en `HomologateServicesTaxonomy.php`
@@ -978,20 +988,41 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					// de represas) activaba igual este nivel y devolvía 6 empresas cuyo nombre empieza con
 					// "REPRESENTACIONES..." - la misma familia de colisión que "grua"~"GRUPO" (documentada
 					// arriba), pero esta vez el umbral 0.65 no alcanzaba a separarla porque "represa" y
-					// "representaciones" comparten un prefijo de 6 letras. Subir el umbral de nuevo habría
-					// sido el mismo parche reactivo de siempre - la causa real es que este nivel se aplica
-					// a CUALQUIER `query` de 5+ letras sin distinguir "esto podría ser un nombre de
-					// empresa" de "esto es un término de negocio genérico", pese a que el propio
-					// clasificador de CIRA YA calcula esa distinción (`queryIntent`) antes de llamar a la
-					// tool - solo que nunca se la pasábamos. Fix: `queryIntent` ahora es un parámetro
-					// opcional de la tool: el nivel de tipeo de nombre se salta cuando el clasificador ya
-					// identificó la consulta como SECTOR/SERVICE/CITY (un término de negocio, no un
-					// intento de nombre propio). Si el llamador no manda `queryIntent` (u otro cliente MCP
-					// distinto de CIRA), el nivel se sigue evaluando igual que antes - este parámetro solo
-					// puede EXCLUIR falsos positivos, nunca ocultar una empresa real que antes aparecía.
+					// "representaciones" comparten un prefijo de 6 letras.
+					//
+					// FASE MCP-5.4 (16 sep 2026) - EL FIX DE ARRIBA (gatear por `queryIntent`) VOLVIÓ A
+					// FALLAR EN VIVO: "represas" volvió a devolver "REPRESENTACIONES..." - encontrado por
+					// el usuario, que señaló correctamente la causa de fondo: `queryIntent` lo calcula el
+					// mismo clasificador de intención cuya NO-determinismo ya está documentado (Fase
+					// MCP-4.8) - la MISMA palabra puede llegar clasificada distinto en llamadas distintas,
+					// así que gatear la seguridad de este nivel en esa clasificación es, en el mejor caso,
+					// una reducción de probabilidad, no una garantía. El usuario lo planteó como principio
+					// general, no solo para "represas": CIRA tiene que actuar sobre la INTENCIÓN real del
+					// texto (¿esto describe una capacidad/experiencia de negocio - pozos, taladros, obras,
+					// camiones, transporte, represas, lo que sea -, o esto describe el nombre propio de UNA
+					// empresa puntual?), no lanzar el mismo tipo de comparación de texto para cualquier
+					// palabra y confiar en que un clasificador externo la etiquete bien cada vez.
+					//
+					// FIX DE FONDO (no otro parche reactivo): este nivel deja de ser un filtro en PARALELO
+					// sin condiciones - pasa a ser el ÚLTIMO recurso de TODOS, evaluado solo si NINGÚN otro
+					// nivel (difuso, certificación, sostenibilidad, taxonomía, experiencia) encontró YA una
+					// coincidencia de concepto real (ver `hasConceptMatch` más abajo, después del
+					// `Promise.all`). Esto no depende de que ningún clasificador externo etiquete bien la
+					// intención: es evidencia objetiva, calculada acá mismo, sobre si la palabra YA
+					// resolvió a algo real como concepto de negocio. Para "represas" en particular: el
+					// nivel de experiencias (Fase MCP-5.3) SÍ encuentra proyectos reales que mencionan
+					// "represa" en su descripción (ver Fase MCP-5, "Montaje de los Empotrados de las Rejas
+					// de Tomas...") - esa coincidencia real ahora suprime este nivel automáticamente, sin
+					// necesitar saber de antemano que "represas" es un concepto y no un nombre. Generaliza
+					// sin cambios a "pozos"/"taladros"/"camiones"/"transporte"/etc.: cualquier término que
+					// ya tenga cobertura real en servicios/taxonomía/experiencia queda protegido igual,
+					// automáticamente, sin necesitar una lista de palabras a mano por caso.
+					// `queryIntent` NO se descarta - sigue siendo una señal adicional válida (si el
+					// clasificador SÍ identificó SECTOR/SERVICE/CITY, es una razón más para no tratarlo
+					// como nombre propio), pero ya no es la ÚNICA barrera.
 					const NAME_TYPO_THRESHOLD = 0.65;
-					const skipNameTypo = queryIntent === 'SECTOR' || queryIntent === 'SERVICE' || queryIntent === 'CITY';
-					const nameTypoRowsPromise: Promise<EmpresaSearchRow[]> = query && query.length >= 5 && !skipNameTypo
+					const queryIntentSaysBusinessTerm = queryIntent === 'SECTOR' || queryIntent === 'SERVICE' || queryIntent === 'CITY';
+					const nameTypoRowsPromise: Promise<EmpresaSearchRow[]> = query && query.length >= 5
 						? sql<EmpresaSearchRow[]>`
 							${empresaSelectAndJoins(sql)}
 							where e.status_id = 1 and word_similarity(unaccent(${query}), unaccent(e.name)) > ${NAME_TYPO_THRESHOLD}
@@ -1050,14 +1081,22 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							`
 							: ([] as EmpresaSearchRow[]);
 
-					if (
-						nameTypoRows.length > 0 ||
+					// FASE MCP-5.4 - ver docblock largo más arriba (junto a `nameTypoRowsPromise`): el
+					// nivel de tipeo de nombre pasa a ser el ÚLTIMO recurso de TODOS, no un filtro en
+					// paralelo sin condiciones. Si CUALQUIER otro nivel ya resolvió esta consulta como un
+					// concepto de negocio real (servicio, certificación, sostenibilidad, taxonomía o
+					// experiencia), la palabra NO se trata como intento de nombre propio - sin importar el
+					// score de similitud de texto contra `e.name`. Objetivo, no depende de que ningún
+					// clasificador externo haya etiquetado bien la intención.
+					const hasConceptMatch =
 						fuzzyRows.length > 0 ||
 						taxonomyRows.length > 0 ||
 						certificationRows.length > 0 ||
 						sustainabilityRows.length > 0 ||
-						experienciaRows.length > 0
-					) {
+						experienciaRows.length > 0;
+					const effectiveNameTypoRows = hasConceptMatch || queryIntentSaysBusinessTerm ? [] : nameTypoRows;
+
+					if (effectiveNameTypoRows.length > 0 || hasConceptMatch) {
 						const nameTypoMatchedVia = `similar a "${query}" (nombre de empresa, posible diferencia de tipeo)`;
 						const fuzzyMatchedVia = describeMatch('fuzzy');
 						const certificationMatchedVia = certificationColumn
@@ -1090,17 +1129,51 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 								`
 								: [];
 
-						function taxonomyMatchedViaFor(empresaId: string): string {
+						// FASE MCP-5.5 (16 sep 2026) - bug real reportado por el usuario: "tratamiento de aguas
+						// de perforacion" mostraba primero empresas que SOLO hacen "Equipos de Perforación"
+						// (sin ninguna relación con tratamiento de agua) por encima de las pocas empresas que
+						// SÍ hacen exactamente lo pedido (ej. "PROYECTO DE EXPANSION SISTEMA DE TRATAMIENTO DE
+						// AGUA EN PLANTA DESHIDRATADORA"). Causa raíz señalada por el usuario: la descomposición
+						// en palabras sueltas ("perforacion", "tratamiento", "aguas") hace que una coincidencia
+						// GENÉRICA de una sola palabra ("perforacion" a secas) compita en igualdad de
+						// condiciones con una coincidencia ESPECÍFICA de la frase compuesta completa
+						// ("tratamiento aguas perforacion") - el orden de prioridad por NIVEL (taxonomía antes
+						// que experiencia) no tiene ninguna relación con qué tan específico es el match real.
+						// Fix: cada coincidencia de taxonomía/experiencia ahora carga su propia
+						// `specificity` (cantidad de palabras significativas de la frase que la encontró - 1
+						// para "perforacion", 3 para "tratamiento aguas perforacion") y el merge final se
+						// ordena por especificidad ANTES que por nivel/fuente - una coincidencia por la frase
+						// compuesta completa siempre gana, sin importar de qué nivel venga. Los niveles que
+						// SIEMPRE comparan contra el `query` completo (difuso/certificación/sostenibilidad/
+						// tipeo de nombre) usan la especificidad del `query` completo como línea base - ya son
+						// al menos tan específicos como cualquier fragmento descompuesto.
+						//
+						// Esto no es entendimiento de intención real (eso queda pendiente como fase aparte,
+						// ver "Fase MCP-5.5" en plan_mcp_cira.md) - es un desempate determinista que evita que
+						// el ruido de una palabra genérica opaque a la coincidencia específica cuando AMBAS
+						// existen, sin agregar ninguna llamada nueva de IA ni otra fuente de variabilidad.
+						const baseQuerySpecificity = query ? Math.max(phraseSpecificity(query), 1) : 1;
+
+						function taxonomyMatchFor(empresaId: string): { text: string; specificity: number } {
 							const categoryIds = taxonomyLinks.filter((l) => String(l.empresa_id) === empresaId).map((l) => l.category_id);
+							let best: { text: string; specificity: number } | null = null;
 							for (const id of categoryIds) {
 								const lex = lexicalByCategoryId.get(id);
-								if (lex) return `coincide con "${query}" (categoría CPV: ${lex.name})`;
-							}
-							for (const id of categoryIds) {
+								if (lex) {
+									const specificity = baseQuerySpecificity;
+									if (!best || specificity > best.specificity) {
+										best = { text: `coincide con "${query}" (categoría CPV: ${lex.name})`, specificity };
+									}
+								}
 								const sem = semanticByCategoryId.get(id);
-								if (sem) return `similar a "${sem.phrase}" (categoría CPV: ${sem.name})`;
+								if (sem) {
+									const specificity = phraseSpecificity(sem.phrase);
+									if (!best || specificity > best.specificity) {
+										best = { text: `similar a "${sem.phrase}" (categoría CPV: ${sem.name})`, specificity };
+									}
+								}
 							}
-							return 'coincide con la taxonomía CPV';
+							return best ?? { text: 'coincide con la taxonomía CPV', specificity: 0 };
 						}
 
 						function sustainabilityMatchedViaFor(empresaId: string): string {
@@ -1112,62 +1185,85 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							return 'coincide con un área de sostenibilidad';
 						}
 
-						function experienciaMatchedViaFor(empresaId: string): string {
+						function experienciaMatchFor(empresaId: string): { text: string; specificity: number } {
 							const ids = experienciaLinks.filter((l) => String(l.empresa_id) === empresaId).map((l) => l.id);
+							let best: { text: string; specificity: number } | null = null;
 							for (const id of ids) {
 								const lex = lexicalExperienciaById.get(id);
-								if (lex) return `coincide con "${query}" (experiencia: ${truncateText(lex.descripcion)})`;
-							}
-							for (const id of ids) {
+								if (lex) {
+									const specificity = baseQuerySpecificity;
+									if (!best || specificity > best.specificity) {
+										best = { text: `coincide con "${query}" (experiencia: ${truncateText(lex.descripcion)})`, specificity };
+									}
+								}
 								const sem = semanticExperienciaById.get(id);
-								if (sem) return `similar a "${sem.phrase}" (experiencia: ${truncateText(sem.name)})`;
+								if (sem) {
+									const specificity = phraseSpecificity(sem.phrase);
+									if (!best || specificity > best.specificity) {
+										best = { text: `similar a "${sem.phrase}" (experiencia: ${truncateText(sem.name)})`, specificity };
+									}
+								}
 							}
-							return 'coincide con un proyecto ejecutado';
+							return best ?? { text: 'coincide con un proyecto ejecutado', specificity: 0 };
 						}
 
-						const taggedNameTypo = nameTypoRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: nameTypoMatchedVia }));
-						const taggedFuzzy = fuzzyRows.map((r) => ({ ...r, match_type: 'fuzzy' as const, matched_via: fuzzyMatchedVia }));
-						const taggedTaxonomy = taxonomyRows.map((r) => ({
-							...r,
-							match_type: 'taxonomy' as const,
-							matched_via: taxonomyMatchedViaFor(String(r.id)),
-						}));
-						const taggedCertification = certificationRows.map((r) => ({
-							...r,
-							match_type: 'certification' as const,
-							matched_via: certificationMatchedVia,
-						}));
-						const taggedSustainability = sustainabilityRows.map((r) => ({
-							...r,
-							match_type: 'sustainability' as const,
-							matched_via: sustainabilityMatchedViaFor(String(r.id)),
-						}));
-						const taggedExperiencia = experienciaRows.map((r) => ({
-							...r,
-							match_type: 'experiencia' as const,
-							matched_via: experienciaMatchedViaFor(String(r.id)),
-						}));
+						type TaggedRow = EmpresaSearchRow & {
+							match_type: 'fuzzy' | 'certification' | 'sustainability' | 'taxonomy' | 'experiencia';
+							matched_via: string;
+						};
+						type Candidate = { row: TaggedRow; specificity: number; tierRank: number };
 
-						// Unión sin duplicar por empresa - orden de prioridad si la misma empresa aparece en
-						// más de una fuente: nombre (más específico/confiable) > catálogo viejo (describeMatch
-						// ya incluye sector/ciudad si corresponde) > certificación/sostenibilidad (match
-						// exacto o léxico curado, alta confianza) > taxonomía > experiencia (la fuente más
-						// aproximada de las 6 - texto libre idiosincrático, semántico como último recurso
-						// entre las nuevas).
-						const seen = new Set(taggedNameTypo.map((r) => r.id));
-						const fuzzyDeduped = taggedFuzzy.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
-						const certificationDeduped = taggedCertification.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
-						const sustainabilityDeduped = taggedSustainability.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
-						const taxonomyDeduped = taggedTaxonomy.filter((r) => !seen.has(r.id) && (seen.add(r.id), true));
-						const experienciaDeduped = taggedExperiencia.filter((r) => !seen.has(r.id));
-						const merged = [
-							...taggedNameTypo,
-							...fuzzyDeduped,
-							...certificationDeduped,
-							...sustainabilityDeduped,
-							...taxonomyDeduped,
-							...experienciaDeduped,
+						const candidates: Candidate[] = [
+							...effectiveNameTypoRows.map(
+								(r): Candidate => ({
+									row: { ...r, match_type: 'fuzzy', matched_via: nameTypoMatchedVia },
+									specificity: baseQuerySpecificity,
+									tierRank: 0,
+								})
+							),
+							...fuzzyRows.map(
+								(r): Candidate => ({
+									row: { ...r, match_type: 'fuzzy', matched_via: fuzzyMatchedVia },
+									specificity: baseQuerySpecificity,
+									tierRank: 1,
+								})
+							),
+							...certificationRows.map(
+								(r): Candidate => ({
+									row: { ...r, match_type: 'certification', matched_via: certificationMatchedVia },
+									specificity: baseQuerySpecificity,
+									tierRank: 2,
+								})
+							),
+							...sustainabilityRows.map((r): Candidate => {
+								const text = sustainabilityMatchedViaFor(String(r.id));
+								return { row: { ...r, match_type: 'sustainability', matched_via: text }, specificity: baseQuerySpecificity, tierRank: 3 };
+							}),
+							...taxonomyRows.map((r): Candidate => {
+								const { text, specificity } = taxonomyMatchFor(String(r.id));
+								return { row: { ...r, match_type: 'taxonomy', matched_via: text }, specificity, tierRank: 4 };
+							}),
+							...experienciaRows.map((r): Candidate => {
+								const { text, specificity } = experienciaMatchFor(String(r.id));
+								return { row: { ...r, match_type: 'experiencia', matched_via: text }, specificity, tierRank: 5 };
+							}),
 						];
+
+						// Una sola fila por empresa: entre todas las coincidencias de esa empresa (sin
+						// importar de qué nivel vengan), gana la más ESPECÍFICA; a igual especificidad, gana
+						// el nivel de mayor confianza (mismo orden que antes: nombre > catálogo viejo >
+						// certificación/sostenibilidad > taxonomía > experiencia).
+						const bestByEmpresaId = new Map<number, Candidate>();
+						for (const c of candidates) {
+							const existing = bestByEmpresaId.get(c.row.id);
+							if (!existing || c.specificity > existing.specificity || (c.specificity === existing.specificity && c.tierRank < existing.tierRank)) {
+								bestByEmpresaId.set(c.row.id, c);
+							}
+						}
+
+						const merged = Array.from(bestByEmpresaId.values())
+							.sort((a, b) => b.specificity - a.specificity || a.tierRank - b.tierRank)
+							.map((c) => c.row);
 
 						if (merged.length > 0) {
 							return { content: [{ type: 'text' as const, text: JSON.stringify(merged, null, 2) }] };
