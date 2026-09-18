@@ -23,6 +23,29 @@ import { getSql } from './db';
  * ILIKE sin `unaccent()` no matchea "construccion" contra "CONSTRUCCIÓN" en la base real. Todo el
  * matching léxico de esta tool usa `unaccent(columna) ilike unaccent(termino)` en ambos lados por
  * este motivo (la extensión `unaccent` ya está habilitada en este proyecto de Supabase).
+ *
+ * **TAXV3-7 (integración con el diccionario de términos)**: hasta esta fase, `search_taxonomy`
+ * solo conocía `taxonomy_categories`/`taxonomy_category_synonyms` (3 filas en total) - todo el
+ * diccionario construido en PerfilAfiliadosCPV (`taxonomy_terms`, 1.889 filas con alias, jerga
+ * regional venezolana y ahora procedencia real por fuente) vivía en tablas que esta tool nunca
+ * leía. Se agrega un nivel `dictionary` entre el léxico y el semántico, con el mismo criterio ya
+ * probado en `TaxonomyCategorySearch::dictionary()` del repo Laravel (PHP, panel de admin): solo
+ * relaciones `taxonomy_term_cpv_relations.status = 'approved'` (nunca el backlog histórico
+ * `needs_review` de 9.288 filas ni los candidatos de baja confianza del Auto Mapper - ver
+ * `MIGRACION_TAXONOMIA_CPV_V2_A_V3.md`), más un fallback de **herencia por concepto canónico**:
+ * si el término que matchea el texto de búsqueda no tiene su propia relación aprobada pero SÍ
+ * pertenece a un `taxonomy_canonical_concepts` con al menos un término hermano que sí la tiene
+ * (ej. "drill pipe" no verificado individualmente hereda CPV-28.04.09G de su hermano aprobado
+ * "tubería de perforación"), se usa la de ese hermano - así una jerga regional nunca necesita
+ * verificación propia para aparecer en la búsqueda real (objetivo central de TAXV3). La relación
+ * PROPIA del término, cuando existe, siempre tiene prioridad sobre la heredada (ver `ORDER BY` del
+ * subquery `dm` abajo: `own_relation DESC`) - evita que un término ya verificado quede opacado por
+ * un hermano de concepto con distinto peso.
+ *
+ * Es un PORT de la misma lógica que ya vive en PHP para el autocompletado del panel (no reemplaza
+ * ese código, ni viceversa - dos runtimes distintos, Cloudflare Worker vs Laravel, no pueden
+ * compartir código directamente; ambos deben mantenerse en sync manualmente si cambia el criterio
+ * de confianza, ver docblock de `TaxonomyCategorySearch`).
  */
 export function registerTaxonomyTools(server: McpServer, env: Env): void {
 	server.registerTool(
@@ -58,6 +81,55 @@ export function registerTaxonomyTools(server: McpServer, env: Env): void {
 					limit ${max}
 				`;
 
+				const lexicalCodes = lexical.map((row) => row.code);
+
+				// TAXV3-7: nivel `dictionary` - ver docblock de la función arriba. `own_relation` (1/0)
+				// ordena antes que `weight` para que la relación PROPIA de un término siempre gane sobre
+				// una heredada por concepto, aunque la heredada tenga mayor peso.
+				const dictionary = lexicalCodes.length < max
+					? await sql<{
+							code: string; level: number; path: string; name_es: string | null; name_en: string | null;
+							matched_term: string; via_term: string | null; weight: number;
+						}[]>`
+						select distinct on (tc.code)
+							tc.code, tc.level, tc.path, tt_es.name as name_es, tt_en.name as name_en,
+							dm.matched_term, dm.via_term, dm.weight
+						from (
+							select
+								r.category_id, t.term as matched_term, null::text as via_term, r.weight, 1 as own_relation
+							from taxonomy_term_cpv_relations r
+							join taxonomy_terms t on t.id = r.term_id
+							left join taxonomy_term_aliases a on a.term_id = t.id
+							where r.status = 'approved'
+								and (
+									unaccent(t.term) ilike unaccent(${'%' + query + '%'})
+									or unaccent(t.canonical_term) ilike unaccent(${'%' + query + '%'})
+									or unaccent(coalesce(a.alias, '')) ilike unaccent(${'%' + query + '%'})
+								)
+							union all
+							select
+								r.category_id, t.term as matched_term, sib.term as via_term, r.weight, 0 as own_relation
+							from taxonomy_terms t
+							join taxonomy_term_concepts link on link.term_id = t.id
+							join taxonomy_term_concepts sib_link on sib_link.concept_id = link.concept_id and sib_link.term_id != t.id
+							join taxonomy_terms sib on sib.id = sib_link.term_id
+							join taxonomy_term_cpv_relations r on r.term_id = sib.id and r.status = 'approved'
+							where (unaccent(t.term) ilike unaccent(${'%' + query + '%'}) or unaccent(t.canonical_term) ilike unaccent(${'%' + query + '%'}))
+								and not exists (
+									select 1 from taxonomy_term_cpv_relations r2
+									where r2.term_id = t.id and r2.status = 'approved'
+								)
+						) dm
+						join taxonomy_categories tc on tc.id = dm.category_id
+						left join taxonomy_category_translations tt_es on tt_es.category_id = tc.id and tt_es.locale = 'es'
+						left join taxonomy_category_translations tt_en on tt_en.category_id = tc.id and tt_en.locale = 'en'
+						where tc.level != 0 and tc.is_active = true
+							${lexicalCodes.length > 0 ? sql`and tc.code not in ${sql(lexicalCodes)}` : sql``}
+						order by tc.code, dm.own_relation desc, dm.weight desc
+						limit ${max - lexicalCodes.length}
+					`
+					: [];
+
 				const queryEmbedding = await env.AI.run('@cf/baai/bge-m3', { text: [query] });
 				const vector = extractEmbeddingVector(queryEmbedding);
 
@@ -89,6 +161,21 @@ export function registerTaxonomyTools(server: McpServer, env: Env): void {
 						name_en: row.name_en,
 						match_type: 'lexical',
 						matched_term: row.matched_term,
+					});
+				}
+
+				for (const row of dictionary) {
+					if (seen.has(row.code) || results.length >= max) continue;
+					seen.add(row.code);
+					results.push({
+						code: row.code,
+						level: row.level,
+						path: row.path,
+						name_es: row.name_es,
+						name_en: row.name_en,
+						match_type: row.via_term ? 'dictionary_concept' : 'dictionary',
+						matched_term: row.matched_term,
+						...(row.via_term ? { via_term: row.via_term } : {}),
 					});
 				}
 
