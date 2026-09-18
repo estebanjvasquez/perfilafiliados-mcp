@@ -1,6 +1,7 @@
 import type { Env } from './index';
 import { getSql } from './db';
 import { extractEmbeddingVectors } from './taxonomy-tools';
+import { resolveCanonicalQueryWithSql, type CanonicalSearchContext } from './canonical-expansion';
 
 /**
  * Fase MCP-7 (Fase A, ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): reemplaza el
@@ -32,11 +33,38 @@ import { extractEmbeddingVectors } from './taxonomy-tools';
  *    evidencia de alta confianza (certificación real, coincidencia léxica literal) - "ISO 9001" con
  *    66 certificaciones reales quedaba diluido, y "grua" arriesgaba perder sus 2 coincidencias
  *    léxicas reales contra ruido. Evidencia estructurada/léxica pesa más en la fusión.
+ *
+ * FASE 23A (ver plan en PerfilAfiliadosCPV, diagnóstico de `cabrias`): agrega 2 listas de evidencia
+ * NUEVAS - `canonical_cpv` (L0-L3: término exacto/alias/concepto canónico/CPV aprobado, resuelto por
+ * `resolveCanonicalQueryWithSql` en `canonical-expansion.ts`) y `canonical_related` (L5: fallback de
+ * UN solo salto por `taxonomy_categories.parent_id` a la Familia inmediata, solo si L0-L3 no trajo
+ * ninguna empresa, penalizado). Corren en el MISMO `Promise.all` que las 8 listas de siempre, NUNCA
+ * como fallback secuencial - insertarlas condicionadas a que las demás fallen reproduciría el bug de
+ * cascada de Fase MCP-4.6 (la taxonomía vieja quedó ahogada por el nivel difuso durante días). Las 8
+ * listas originales NO se tocan. `canonical-expansion.ts` reduce por su cuenta sinónimos que apuntan
+ * al mismo CPV (cabria/derrick/mast) a UN solo match antes de llegar acá - evita triple conteo
+ * DENTRO de las listas canónicas. Sigue existiendo la posibilidad de que el MISMO CPV llegue también
+ * por `lexicalTaxonomyList` (tabla vieja de sinónimos) o `vectorTaxonomyList` (embedding) de forma
+ * independiente - riesgo aceptado y documentado (no distinto en espíritu al ya aceptado arriba para
+ * "reciclaje"~"VIALIDAD Y DRENAJES"), verificado explícitamente contra el benchmark de la Fase 23A
+ * antes de desplegar (ver `candidate_count_by_source` en `debugCanonicalSearch`).
  */
 
 export const RRF_K = 60;
 
-const SERVICE_VECTOR_LIMIT = 15;
+// Fase MCP-7.2 (17 sep 2026): bajado de 15 a 8. Medido en vivo (usuario reportó el patrón de
+// "rellena hasta 20" - confirmado real): servicios genéricos/vagos ("OPERADOR PRIVADO" a 0.572,
+// "ADQUISICIÓN, PROCESAMIENTO E INTERPRETACIÓN DE DATOS" a 0.594) NO tienen un salto limpio de
+// distancia que los separe de servicios genuinamente relevantes para OTRAS consultas ("SERVICIOS
+// LOGÍSTICA TRANSPORTE" mide 0.567-0.593 para "camiones" - un match real, en el MISMO rango que el
+// ruido de "criptoactivos") - a diferencia de `TAXONOMY_THRESHOLD` (que sí tuvo un salto limpio
+// medible), bajar `SERVICE_THRESHOLD` sacaría ruido real pero también resultados genuinos de otras
+// consultas. Como el catálogo de servicios es chico (112 entradas), la mitigación de fondo es
+// acotar cuántos candidatos de UNA SOLA señal semántica débil pueden entrar por frase, no perseguir
+// un umbral perfecto que no existe en los datos. Limitación conocida y aceptada: esto reduce el
+// ruido, no lo elimina del todo - un ajuste más fino (ej. exigir corroboración de otra lista antes
+// de mostrar un resultado solo-semántico) queda pendiente si el ruido sigue siendo un problema.
+const SERVICE_VECTOR_LIMIT = 8;
 const TAXONOMY_VECTOR_LIMIT = 10;
 const EXPERIENCIA_VECTOR_LIMIT = 30;
 const FULLTEXT_LIMIT = 30;
@@ -73,7 +101,17 @@ const GENERIC_ATTRACTOR_FAMILY_CODES = ['CPV-29.02', 'CPV-12.04', 'CPV-48.02', '
 const NAME_TYPO_THRESHOLD = 0.65;
 const NAME_TYPO_MIN_LENGTH = 5;
 
-type EvidenceList = 'structured' | 'name_typo' | 'lexical_experiencia' | 'lexical_taxonomy' | 'fulltext' | 'service' | 'taxonomy' | 'experiencia';
+type EvidenceList =
+	| 'structured'
+	| 'name_typo'
+	| 'lexical_experiencia'
+	| 'lexical_taxonomy'
+	| 'fulltext'
+	| 'service'
+	| 'taxonomy'
+	| 'experiencia'
+	| 'canonical_cpv'
+	| 'canonical_related';
 
 const LIST_WEIGHTS: Record<EvidenceList, number> = {
 	structured: 2.5,
@@ -84,6 +122,14 @@ const LIST_WEIGHTS: Record<EvidenceList, number> = {
 	service: 1.0,
 	experiencia: 1.0,
 	taxonomy: 0.5,
+	// Fase 23A: tier alto porque el CPV ya viene de una relación `approved` (curada o heredada de un
+	// concepto canónico), no de una coincidencia difusa - mismo orden de magnitud que la evidencia
+	// léxica directa (`lexical_taxonomy`), nunca por debajo de `taxonomy` (semántico puro).
+	canonical_cpv: 2.0,
+	// Deliberadamente bajo - es un fallback de UN salto de familia (L5), tagueado RELATED_CANDIDATE
+	// (no DIRECT_MATCH), penalización adicional ya aplicada por `mcp_canonical.level5_fallback_penalty`
+	// dentro del propio weight de cada match (ver `canonical-expansion.ts`).
+	canonical_related: 0.4,
 };
 
 // match_type expuesto en la respuesta final, derivado de qué lista aportó la evidencia de mayor
@@ -98,6 +144,8 @@ const MATCH_TYPE_BY_LIST: Record<EvidenceList, string> = {
 	service: 'semantic',
 	taxonomy: 'semantic',
 	experiencia: 'semantic',
+	canonical_cpv: 'canonical_direct',
+	canonical_related: 'canonical_related_candidate',
 };
 
 export type Evidence = { empresa_id: number; label: string };
@@ -110,15 +158,38 @@ export async function embedPhrase(env: Env, phrase: string): Promise<string | nu
 	return extractEmbeddingVectors(result)[0] ?? null;
 }
 
+// Fase MCP-7.2 (17 sep 2026): longitud mínima para matchear el NOMBRE de empresa por substring -
+// defensa contra la colisión recurrente "represas"~"REPRESENTACIONES..." (5 causas raíz DISTINTAS
+// de la MISMA colisión de fondo a lo largo del proyecto: Fase MCP-4.8/5.4/6.1/7/7.2). Esta vez el
+// agente externo de n8n truncó la raíz a "repres" (6 letras) - que son literalmente las primeras 6
+// letras de "REPRESENTACIONES...", "REPROQUIMICA", etc. - y `ilike '%repres%'` sin conciencia de
+// límites de palabra matcheaba por coincidencia. Verificado en vivo contra Supabase real antes de
+// fijar el número: "repres" (6) matchea las 6 empresas de la familia REPRESENTACIONES; "represa" (7)
+// no matchea NINGUNA empresa por nombre (no hace falta - el caso real se resuelve por experiencia);
+// "construccion" (12) sigue encontrando VINCCLER (18 empresas reales, sin pérdida); "camion" (6)
+// pierde a DIMACA por ESTA vía puntual, pero full-text (con stemming real, ver `fullTextList`)
+// encuentra a DIMACA de todas formas por su nombre indexado - sin pérdida neta. Servicio/sector NO
+// llevan este mínimo: son catálogos curados y acotados (112/8 entradas), sin el riesgo de razones
+// sociales libres que sí tiene `empresas.name`.
+const NAME_SUBSTRING_MIN_LENGTH = 7;
+
 async function structuredList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
 	const like = '%' + phrase + '%';
-	const nameRows = await sql<{ empresa_id: number }[]>`
+	const nameRows =
+		phrase.length >= NAME_SUBSTRING_MIN_LENGTH
+			? await sql<{ empresa_id: number }[]>`
+				select distinct e.id as empresa_id
+				from empresas e
+				where e.status_id = 1 and unaccent(e.name) ilike unaccent(${like})
+			`
+			: [];
+
+	const serviceSectorRows = await sql<{ empresa_id: number }[]>`
 		select distinct e.id as empresa_id
 		from empresas e
 		where e.status_id = 1
 			and (
-				unaccent(e.name) ilike unaccent(${like})
-				or exists (
+				exists (
 					select 1 from empresa_sector_service ess join services sv on sv.id = ess.service_id
 					where ess.empresa_id = e.id and unaccent(sv.name) ilike unaccent(${like})
 				)
@@ -150,7 +221,7 @@ async function structuredList(sql: ReturnType<typeof getSql>, phrase: string): P
 
 	const label = matchedCertColumn ? `coincide con la certificación ${matchedCertColumn.toUpperCase()}` : `coincide con "${phrase}"`;
 
-	return [...nameRows, ...certRows, ...sustRows].map((r) => ({ empresa_id: r.empresa_id, label }));
+	return [...nameRows, ...serviceSectorRows, ...certRows, ...sustRows].map((r) => ({ empresa_id: r.empresa_id, label }));
 }
 
 async function nameTypoList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
@@ -190,6 +261,44 @@ async function lexicalTaxonomyList(sql: ReturnType<typeof getSql>, phrase: strin
 			)
 	`;
 	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `coincide con "${phrase}" (categoría CPV: ${r.name})` }));
+}
+
+/**
+ * Fase 23A: empresas con `empresa_taxonomy_category` en alguno de los CPV DIRECTOS que
+ * `resolveCanonicalQueryWithSql` ya resolvió para esta frase (L0-L3 - término exacto/alias/concepto
+ * canónico/CPV aprobado). No vuelve a tocar `taxonomy_terms` - el contexto ya viene resuelto.
+ */
+async function canonicalCpvList(sql: ReturnType<typeof getSql>, ctx: CanonicalSearchContext): Promise<Evidence[]> {
+	if (ctx.directCpvCodes.length === 0) return [];
+
+	const rows = await sql<{ empresa_id: number }[]>`
+		select distinct etc.empresa_id
+		from empresa_taxonomy_category etc
+		join taxonomy_categories tc on tc.id = etc.category_id
+		where tc.code in ${sql(ctx.directCpvCodes)}
+	`;
+	const conceptLabel = ctx.canonicalConcepts[0] ? ` (concepto: ${ctx.canonicalConcepts[0]})` : '';
+	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `coincide con "${ctx.originalQuery}" vía taxonomía CPV${conceptLabel}` }));
+}
+
+/**
+ * Fase 23A: fallback L5 - solo si `canonicalCpvList` no encontró NINGUNA empresa para esta frase
+ * (decisión en TypeScript, no una segunda consulta condicional - `relatedCpvCodes` ya vino en la
+ * MISMA consulta de `resolveCanonicalQueryWithSql`). Tag distinto (`canonical_related_candidate` en
+ * `MATCH_TYPE_BY_LIST`) para que la respuesta final pueda distinguir DIRECT_MATCH de
+ * RELATED_CANDIDATE - nunca se presenta con la misma certeza.
+ */
+async function canonicalRelatedList(sql: ReturnType<typeof getSql>, ctx: CanonicalSearchContext, directHits: number): Promise<Evidence[]> {
+	if (directHits > 0 || ctx.relatedCpvCodes.length === 0) return [];
+
+	const rows = await sql<{ empresa_id: number }[]>`
+		select distinct etc.empresa_id
+		from empresa_taxonomy_category etc
+		join taxonomy_categories tc on tc.id = etc.category_id
+		where tc.code in ${sql(ctx.relatedCpvCodes)}
+	`;
+	const conceptLabel = ctx.canonicalConcepts[0] ? ` (familia relacionada con: ${ctx.canonicalConcepts[0]})` : '';
+	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `candidato relacionado con "${ctx.originalQuery}"${conceptLabel} - no es coincidencia directa` }));
 }
 
 async function fullTextList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
@@ -262,14 +371,16 @@ function truncate(text: string, max = 100): string {
  * `resolve_search_intent`), el llamador corre esta función una vez por frase y suma los mapas de
  * score resultantes - RRF es composicional, cada frase adicional es simplemente más evidencia.
  */
-export async function resolvePhraseEvidence(
-	sql: ReturnType<typeof getSql>,
-	env: Env,
-	phrase: string
-): Promise<Map<number, { score: number; matchType: string; matchedVia: string }>> {
+type PhraseEvidenceDetail = {
+	namedLists: Record<EvidenceList, Evidence[]>;
+	canonicalCtx: CanonicalSearchContext;
+	result: Map<number, { score: number; matchType: string; matchedVia: string }>;
+};
+
+async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, phrase: string): Promise<PhraseEvidenceDetail> {
 	const vector = await embedPhrase(env, phrase);
 
-	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia] = await Promise.all([
+	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
 		structuredList(sql, phrase),
 		lexicalExperienciaList(sql, phrase),
 		lexicalTaxonomyList(sql, phrase),
@@ -277,7 +388,16 @@ export async function resolvePhraseEvidence(
 		vector ? vectorServiceList(sql, vector, phrase) : Promise.resolve([]),
 		vector ? vectorTaxonomyList(sql, vector, phrase) : Promise.resolve([]),
 		vector ? vectorExperienciaList(sql, vector, phrase) : Promise.resolve([]),
+		resolveCanonicalQueryWithSql(sql, phrase),
 	]);
+
+	// Fase 23A: canonicalRelated depende del RESULTADO de canonicalDirect (¿hubo 0 empresas directas?
+	// - decisión explícita, no una starvation accidental como la de Fase MCP-4.6) - por eso corre
+	// DESPUÉS del Promise.all de arriba, no dentro. Nunca agrega una consulta si `resolveCanonicalQuery`
+	// no encontró ningún concepto para esta frase (`canonicalCpvList`/`canonicalRelatedList` retornan
+	// [] sin tocar la base cuando `directCpvCodes`/`relatedCpvCodes` vienen vacíos).
+	const canonicalDirect = await canonicalCpvList(sql, canonicalCtx);
+	const canonicalRelated = await canonicalRelatedList(sql, canonicalCtx, canonicalDirect.length);
 
 	// Fase MCP-5.4 (heredado): "represas" volvía a colisionar con "REPRESENTACIONES..." la primera
 	// vez que se probó esto hoy - el tipeo de nombre corría SIEMPRE, sin las salvaguardas que esa
@@ -291,7 +411,9 @@ export async function resolvePhraseEvidence(
 		fulltext.length > 0 ||
 		service.length > 0 ||
 		taxonomy.length > 0 ||
-		experiencia.length > 0;
+		experiencia.length > 0 ||
+		canonicalDirect.length > 0 ||
+		canonicalRelated.length > 0;
 	const nameTypo = hasConceptMatch ? [] : await nameTypoList(sql, phrase);
 
 	const namedLists: Record<EvidenceList, Evidence[]> = {
@@ -303,6 +425,8 @@ export async function resolvePhraseEvidence(
 		service,
 		taxonomy,
 		experiencia,
+		canonical_cpv: canonicalDirect,
+		canonical_related: canonicalRelated,
 	};
 
 	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
@@ -333,7 +457,55 @@ export async function resolvePhraseEvidence(
 		}
 	}
 
-	return result;
+	return { namedLists, canonicalCtx, result };
+}
+
+/**
+ * Resuelve TODA la evidencia (estructurada + léxica + full-text + vectorial + canónica, Fase 23A)
+ * para UNA frase y la fusiona por RRF ponderado. Para `multi_concept` (varias frases independientes
+ * de `resolve_search_intent`), el llamador corre esta función una vez por frase y suma los mapas de
+ * score resultantes - RRF es composicional, cada frase adicional es simplemente más evidencia.
+ */
+export async function resolvePhraseEvidence(
+	sql: ReturnType<typeof getSql>,
+	env: Env,
+	phrase: string
+): Promise<Map<number, { score: number; matchType: string; matchedVia: string }>> {
+	return (await computePhraseEvidence(sql, env, phrase)).result;
+}
+
+/**
+ * Fase 23A: diagnóstico opcional (punto 16 del pedido) - mismo pipeline exacto que
+ * `resolvePhraseEvidence`, pero devuelve el desglose completo por señal en vez de solo el mapa
+ * fusionado. NO se expone como tool MCP de cara a CIRA - `search_empresas` lo activa solo con
+ * `debug: true` (ver `empresa-tools.ts`), para uso manual de administración/benchmark.
+ * `candidate_count_by_source` es OBLIGATORIO revisar contra el benchmark completo antes de
+ * desplegar - es la única forma de detectar si el mismo CPV llega duplicado por `canonical_cpv` Y
+ * por `lexical_taxonomy`/`taxonomy` (riesgo aceptado y documentado, ver docblock de este archivo).
+ */
+export async function debugCanonicalSearch(sql: ReturnType<typeof getSql>, env: Env, phrase: string) {
+	const { namedLists, canonicalCtx, result } = await computePhraseEvidence(sql, env, phrase);
+
+	const candidateCountBySource = Object.fromEntries(
+		(Object.entries(namedLists) as [EvidenceList, Evidence[]][]).map(([list, rows]) => [list, new Set(rows.map((r) => r.empresa_id)).size])
+	);
+
+	const fallbackLevelUsed: 'none' | 'L0_L3_direct' | 'L5_family_fallback' =
+		namedLists.canonical_cpv.length > 0 ? 'L0_L3_direct' : namedLists.canonical_related.length > 0 ? 'L5_family_fallback' : 'none';
+
+	return {
+		original_query: canonicalCtx.originalQuery,
+		detected_intent: canonicalCtx.detectedIntent,
+		regional_terms: canonicalCtx.regionalTerms,
+		canonical_concepts: canonicalCtx.canonicalConcepts,
+		expanded_terms: canonicalCtx.matches.map((m) => m.term),
+		cpv_relations: canonicalCtx.matches.map((m) => ({ level: m.level, cpv_code: m.cpvCode, weight: m.weight, via_term: m.viaTerm })),
+		candidate_sources: Object.keys(namedLists).filter((list) => candidateCountBySource[list] > 0),
+		candidate_count_by_source: candidateCountBySource,
+		deduplicated_candidate_count: result.size,
+		fallback_level_used: fallbackLevelUsed,
+		final_count: result.size,
+	};
 }
 
 /** Empresas con al menos una coincidencia estructurada/léxica directa (substring) para esta frase - usado para decidir el límite final de salida, mismo criterio de "un match literal nunca es ruido a recortar" que ya usaba el nivel EXACTO del sistema anterior (Fase MCP-4.9). */

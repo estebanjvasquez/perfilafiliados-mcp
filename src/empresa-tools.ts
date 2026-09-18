@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
-import { resolvePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectMatches } from './hybrid-search';
+import { resolvePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectMatches, debugCanonicalSearch } from './hybrid-search';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -352,9 +352,17 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							'busca por separado y se combinan los resultados). Si no llamaste a resolve_search_intent, ' +
 							'omitilo - "query" solo sigue funcionando igual que siempre.'
 					),
+				debug: z
+					.boolean()
+					.optional()
+					.describe(
+						'Fase 23A - uso interno de administración/benchmark, NUNCA para el flujo normal de CIRA. Si es ' +
+							'true, en vez de buscar empresas devuelve el objeto de diagnóstico de expansión canónica ' +
+							'(término detectado, conceptos, CPVs, conteo de candidatos por señal) para "query".'
+					),
 			},
 		},
-		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases }) => {
+		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases, debug }) => {
 			if (!query && !sector && !ciudad && !categoria_codigo) {
 				return {
 					content: [
@@ -374,6 +382,17 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			// reales.
 			const exactMax = limit ?? 150;
 			const sql = getSql(env);
+
+			// Fase 23A: modo diagnóstico - nunca lo usa CIRA en el flujo normal (el prompt de n8n no lo
+			// conoce), solo administración/benchmark vía curl/Postman con debug:true explícito.
+			if (debug && query) {
+				try {
+					const diagnostics = await debugCanonicalSearch(sql, env, query);
+					return { content: [{ type: 'text' as const, text: JSON.stringify(diagnostics, null, 2) }] };
+				} finally {
+					await sql.end({ timeout: 1 });
+				}
+			}
 
 			/** Filtros estructurados (sector/ciudad/categoria_codigo) - iguales para el filtro puro y para acotar el resultado fusionado. */
 			function structuredFilters() {
