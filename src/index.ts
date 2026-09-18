@@ -59,13 +59,33 @@ export default {
 			return handleMcp(request, env, ctx);
 		}
 
-		if (url.pathname === '/debug-search' && request.method === 'POST') {
-			return handleDebugSearch(request, env);
+		if (url.pathname === '/debug-search') {
+			// Fase 23B, bug real encontrado en vivo (18 sep 2026): `cira-test/index.html` corre en
+			// `pruebas.camarapetrolera.app` y llama a este Worker en un origen distinto
+			// (`*.workers.dev`) mandando un header `Authorization` custom - eso dispara un preflight
+			// `OPTIONS` del navegador ANTES del POST real. Sin manejarlo ni devolver headers CORS, el
+			// navegador bloquea la llamada entera del lado del cliente (el fetch ni siquiera llega a
+			// intentar el POST) - el modo debug parecía "no hacer nada" porque literalmente nunca se
+			// mandaba la petición, no porque el backend fallara. `/mcp`/`/embed` NO necesitan esto:
+			// los llama n8n/Laravel server-to-server, nunca un navegador.
+			if (request.method === 'OPTIONS') {
+				return new Response(null, { status: 204, headers: CORS_HEADERS });
+			}
+			if (request.method === 'POST') {
+				return handleDebugSearch(request, env);
+			}
 		}
 
 		return new Response('Not found', { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
+
+const CORS_HEADERS: Record<string, string> = {
+	'Access-Control-Allow-Origin': '*',
+	'Access-Control-Allow-Methods': 'POST, OPTIONS',
+	'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+	'Access-Control-Max-Age': '86400',
+};
 
 async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const auth = request.headers.get('Authorization') ?? '';
@@ -101,8 +121,13 @@ interface DebugSearchRequestBody {
 async function handleDebugSearch(request: Request, env: Env): Promise<Response> {
 	const auth = request.headers.get('Authorization') ?? '';
 
+	// Fase 23B: TODAS las respuestas de esta ruta necesitan `Access-Control-Allow-Origin` (no solo
+	// el preflight OPTIONS) - el navegador exige el header en la respuesta REAL para exponérsela al
+	// JS que hizo el fetch. El 401 de clave incorrecta es el caso que más importa: sin el header acá,
+	// el navegador lo reporta como un genérico "Failed to fetch" y la página nunca puede mostrar
+	// "clave incorrecta" (bug real encontrado en vivo probando esto contra cira-test/index.html).
 	if (auth !== `Bearer ${env.DEBUG_TOKEN}`) {
-		return Response.json({ error: 'unauthorized' }, { status: 401 });
+		return Response.json({ error: 'unauthorized' }, { status: 401, headers: CORS_HEADERS });
 	}
 
 	let body: DebugSearchRequestBody;
@@ -110,16 +135,16 @@ async function handleDebugSearch(request: Request, env: Env): Promise<Response> 
 	try {
 		body = await request.json();
 	} catch {
-		return Response.json({ error: 'invalid_json' }, { status: 400 });
+		return Response.json({ error: 'invalid_json' }, { status: 400, headers: CORS_HEADERS });
 	}
 
 	if (typeof body.query !== 'string' || body.query.trim().length < 2) {
-		return Response.json({ error: 'query must be a string with at least 2 characters' }, { status: 400 });
+		return Response.json({ error: 'query must be a string with at least 2 characters' }, { status: 400, headers: CORS_HEADERS });
 	}
 
 	const report = await resolveDebugSearch(env, body.query.trim(), body.resolvedPhrases ?? []);
 
-	return Response.json(report);
+	return Response.json(report, { headers: CORS_HEADERS });
 }
 
 async function handleEmbed(request: Request, env: Env): Promise<Response> {
