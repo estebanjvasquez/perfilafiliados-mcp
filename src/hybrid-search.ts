@@ -546,7 +546,7 @@ export async function debugCanonicalSearch(sql: ReturnType<typeof getSql>, env: 
  * nunca una heurística nueva ni una consulta adicional. Ver plan de Fase 23B, sección "DIAGNOSTIC
  * FLAGS" para el razonamiento de cada una.
  */
-function buildDiagnosticFlags(canonicalCtx: CanonicalSearchContext, namedLists: Record<EvidenceList, Evidence[]>): string[] {
+export function buildDiagnosticFlags(canonicalCtx: CanonicalSearchContext, namedLists: Record<EvidenceList, Evidence[]>): string[] {
 	const flags: string[] = [];
 
 	const hasRegionalOrConcept = canonicalCtx.regionalTerms.length > 0 || canonicalCtx.canonicalConcepts.length > 0;

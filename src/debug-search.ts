@@ -5,6 +5,7 @@ import {
 	mergePhraseEvidence,
 	rankedIds,
 	countDirectMatches,
+	buildDiagnosticFlags,
 	LIST_WEIGHTS,
 	MATCH_TYPE_BY_LIST,
 	type EvidenceList,
@@ -95,12 +96,7 @@ function buildReportShape(input: {
 
 	const candidates = ranked.map((r, index) => buildCandidateDetail(r, index, phraseDetails, empresasById));
 
-	const diagnosticFlags = buildDebugDiagnosticFlags({
-		candidateCountBySource,
-		crawlerSystemWideTotal,
-		allMatches,
-		candidates,
-	});
+	const diagnosticFlags = buildDebugDiagnosticFlags({ phraseDetails, crawlerSystemWideTotal });
 
 	return {
 		debug_id: debugId,
@@ -239,17 +235,30 @@ function buildWhyIncluded(evidence: { source: EvidenceList; label: string }[], s
 	return `Evidencia principal (${strength}): ${primary.label}.${evidence.length > 1 ? ` Además: ${evidence.slice(1).map((e) => e.label).join('; ')}.` : ''}`;
 }
 
-function buildDebugDiagnosticFlags(input: {
-	candidateCountBySource: Record<string, number>;
-	crawlerSystemWideTotal: number;
-	allMatches: unknown[];
-	candidates: ReturnType<typeof buildCandidateDetail>[];
-}): string[] {
-	const flags: string[] = [];
-	if (input.crawlerSystemWideTotal < 50) flags.push('NO_CRAWLER_EVIDENCE');
-	if (input.candidates.some((c) => c.evidence_sources.length > 2)) flags.push('POSSIBLE_DOUBLE_COUNTING');
-	if (flags.length === 0) flags.push('NO_ISSUES_DETECTED');
-	return flags;
+/**
+ * Fix post-harness (19 sep 2026): antes este archivo tenía su propia reimplementación de banderas
+ * de diagnóstico (contaba `evidence_sources.length > 2` como proxy de "double counting"), divergente
+ * y más débil que `buildDiagnosticFlags` (hybrid-search.ts), que ya existía desde Fase 23A con la
+ * comparación real (mismo `empresa_id` cruzando `canonical_cpv` y `lexical_taxonomy`/`taxonomy`) y 3
+ * banderas adicionales (`CANONICAL_TERM_WITHOUT_CPV`, `CPV_WITHOUT_COMPANIES`,
+ * `EXPANSION_NOT_PROPAGATED`). Duplicar esa lógica es exactamente lo que la premisa de "no hardcoding
+ * / no duplicar lógica existente" prohíbe - se corre la función real una vez por frase (mismo
+ * criterio de merge multi-frase que `allMatches`/`regionalTerms` ya usan) y se une con la bandera de
+ * cobertura de crawler, que vive acá porque `buildDiagnosticFlags` no tiene acceso a esa tabla.
+ */
+function buildDebugDiagnosticFlags(input: { phraseDetails: { phrase: string; detail: PhraseEvidenceDetail }[]; crawlerSystemWideTotal: number }): string[] {
+	const flags = new Set<string>();
+
+	for (const { detail } of input.phraseDetails) {
+		for (const flag of buildDiagnosticFlags(detail.canonicalCtx, detail.namedLists)) {
+			if (flag !== 'NO_ISSUES_DETECTED') flags.add(flag);
+		}
+	}
+
+	if (input.crawlerSystemWideTotal < 50) flags.add('NO_CRAWLER_EVIDENCE');
+	if (flags.size === 0) flags.add('NO_ISSUES_DETECTED');
+
+	return Array.from(flags);
 }
 
 export async function resolveDebugSearch(env: Env, query: string, resolvedPhrases: string[] = []) {
