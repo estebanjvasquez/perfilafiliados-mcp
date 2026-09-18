@@ -24,6 +24,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { registerTaxonomyTools } from './taxonomy-tools';
 import { registerEmpresaTools } from './empresa-tools';
 import { registerIntentTools } from './intent-tools';
+import { resolveDebugSearch } from './debug-search';
 
 export interface Env {
 	AI: Ai;
@@ -31,6 +32,11 @@ export interface Env {
 	EMBED_TOKEN: string;
 	MCP_TOKEN: string;
 	OPENAI_API_KEY: string;
+	// Fase 23B: token propio, independiente de MCP_TOKEN/EMBED_TOKEN - protege /debug-search, un
+	// endpoint de solo lectura para el modo DEBUG de public/cira-test/index.html. Deliberadamente
+	// NO se embebe en esa página (sin login) - la página guarda esta clave en sessionStorage cuando
+	// el admin escribe "/debug-on <clave>", nunca en el código fuente servido (ver plan de Fase 23B).
+	DEBUG_TOKEN: string;
 }
 
 interface EmbedRequestBody {
@@ -51,6 +57,10 @@ export default {
 
 		if (url.pathname === '/mcp') {
 			return handleMcp(request, env, ctx);
+		}
+
+		if (url.pathname === '/debug-search' && request.method === 'POST') {
+			return handleDebugSearch(request, env);
 		}
 
 		return new Response('Not found', { status: 404 });
@@ -74,6 +84,42 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
 	});
 
 	return handler.fetch(request);
+}
+
+interface DebugSearchRequestBody {
+	query: string;
+	resolvedPhrases?: string[];
+}
+
+/**
+ * Fase 23B: endpoint de solo lectura para el modo DEBUG de `public/cira-test/index.html`
+ * (`/debug-on`). Deliberadamente FUERA del protocolo MCP (no necesita el nodo "MCP Client Tool" de
+ * n8n ni el `MCP_TOKEN` real) y fuera del flujo de CIRA - nadie más lo llama. Mismo patrón de auth
+ * simple que `/embed` (Bearer contra un secret propio), con su propio `DEBUG_TOKEN` para poder
+ * revocarlo/rotarlo sin afectar `/mcp`/`/embed`.
+ */
+async function handleDebugSearch(request: Request, env: Env): Promise<Response> {
+	const auth = request.headers.get('Authorization') ?? '';
+
+	if (auth !== `Bearer ${env.DEBUG_TOKEN}`) {
+		return Response.json({ error: 'unauthorized' }, { status: 401 });
+	}
+
+	let body: DebugSearchRequestBody;
+
+	try {
+		body = await request.json();
+	} catch {
+		return Response.json({ error: 'invalid_json' }, { status: 400 });
+	}
+
+	if (typeof body.query !== 'string' || body.query.trim().length < 2) {
+		return Response.json({ error: 'query must be a string with at least 2 characters' }, { status: 400 });
+	}
+
+	const report = await resolveDebugSearch(env, body.query.trim(), body.resolvedPhrases ?? []);
+
+	return Response.json(report);
 }
 
 async function handleEmbed(request: Request, env: Env): Promise<Response> {

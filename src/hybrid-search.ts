@@ -101,7 +101,7 @@ const GENERIC_ATTRACTOR_FAMILY_CODES = ['CPV-29.02', 'CPV-12.04', 'CPV-48.02', '
 const NAME_TYPO_THRESHOLD = 0.65;
 const NAME_TYPO_MIN_LENGTH = 5;
 
-type EvidenceList =
+export type EvidenceList =
 	| 'structured'
 	| 'name_typo'
 	| 'lexical_experiencia'
@@ -113,7 +113,7 @@ type EvidenceList =
 	| 'canonical_cpv'
 	| 'canonical_related';
 
-const LIST_WEIGHTS: Record<EvidenceList, number> = {
+export const LIST_WEIGHTS: Record<EvidenceList, number> = {
 	structured: 2.5,
 	name_typo: 2.0,
 	lexical_experiencia: 2.5,
@@ -135,7 +135,7 @@ const LIST_WEIGHTS: Record<EvidenceList, number> = {
 // match_type expuesto en la respuesta final, derivado de qué lista aportó la evidencia de mayor
 // peso para esa empresa - mismo espíritu explicativo que `matched_via` ya tenía en el sistema
 // anterior (Fase MCP-4.4: "nunca dejar sin explicar por qué apareció una empresa").
-const MATCH_TYPE_BY_LIST: Record<EvidenceList, string> = {
+export const MATCH_TYPE_BY_LIST: Record<EvidenceList, string> = {
 	structured: 'exact',
 	name_typo: 'fuzzy',
 	lexical_experiencia: 'lexical',
@@ -371,24 +371,42 @@ function truncate(text: string, max = 100): string {
  * `resolve_search_intent`), el llamador corre esta función una vez por frase y suma los mapas de
  * score resultantes - RRF es composicional, cada frase adicional es simplemente más evidencia.
  */
-type PhraseEvidenceDetail = {
+export type PhraseEvidenceDetail = {
 	namedLists: Record<EvidenceList, Evidence[]>;
 	canonicalCtx: CanonicalSearchContext;
 	result: Map<number, { score: number; matchType: string; matchedVia: string }>;
+	/** Fase 23B: contribución RRF que CADA señal aportó a CADA empresa - ya se calculaba al vuelo
+	 * dentro del loop de fusión de abajo, solo faltaba guardarla desagregada en vez de colapsarla
+	 * directo al score final. Usado por `/debug-search` para el desglose por empresa (nunca por el
+	 * flujo normal de `search_empresas`). */
+	perEmpresaContributions: Map<number, Partial<Record<EvidenceList, number>>>;
+	/** Fase 23B: `performance.now()` antes/después de cada señal - medir no cambia el orden de
+	 * ejecución (siguen corriendo en el mismo `Promise.all`), solo se envuelve cada promesa. */
+	timingsMs: Record<string, number>;
 };
 
-async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, phrase: string): Promise<PhraseEvidenceDetail> {
+/** Fase 23B: envuelve una promesa de señal para medir su duración sin alterar cuándo se resuelve ni su valor - el `Promise.all` de abajo sigue esperando exactamente las mismas promesas, en paralelo, en el mismo orden. */
+function timed<T>(timingsMs: Record<string, number>, label: string, promise: Promise<T>): Promise<T> {
+	const start = performance.now();
+	return promise.then((value) => {
+		timingsMs[label] = Math.round((performance.now() - start) * 100) / 100;
+		return value;
+	});
+}
+
+export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, phrase: string): Promise<PhraseEvidenceDetail> {
+	const timingsMs: Record<string, number> = {};
 	const vector = await embedPhrase(env, phrase);
 
 	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
-		structuredList(sql, phrase),
-		lexicalExperienciaList(sql, phrase),
-		lexicalTaxonomyList(sql, phrase),
-		fullTextList(sql, phrase),
-		vector ? vectorServiceList(sql, vector, phrase) : Promise.resolve([]),
-		vector ? vectorTaxonomyList(sql, vector, phrase) : Promise.resolve([]),
-		vector ? vectorExperienciaList(sql, vector, phrase) : Promise.resolve([]),
-		resolveCanonicalQueryWithSql(sql, phrase),
+		timed(timingsMs, 'structured', structuredList(sql, phrase)),
+		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase)),
+		timed(timingsMs, 'lexical_taxonomy', lexicalTaxonomyList(sql, phrase)),
+		timed(timingsMs, 'fulltext', fullTextList(sql, phrase)),
+		vector ? timed(timingsMs, 'service', vectorServiceList(sql, vector, phrase)) : Promise.resolve([]),
+		vector ? timed(timingsMs, 'taxonomy', vectorTaxonomyList(sql, vector, phrase)) : Promise.resolve([]),
+		vector ? timed(timingsMs, 'experiencia', vectorExperienciaList(sql, vector, phrase)) : Promise.resolve([]),
+		timed(timingsMs, 'canonical_resolver', resolveCanonicalQueryWithSql(sql, phrase)),
 	]);
 
 	// Fase 23A: canonicalRelated depende del RESULTADO de canonicalDirect (¿hubo 0 empresas directas?
@@ -396,8 +414,8 @@ async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, p
 	// DESPUÉS del Promise.all de arriba, no dentro. Nunca agrega una consulta si `resolveCanonicalQuery`
 	// no encontró ningún concepto para esta frase (`canonicalCpvList`/`canonicalRelatedList` retornan
 	// [] sin tocar la base cuando `directCpvCodes`/`relatedCpvCodes` vienen vacíos).
-	const canonicalDirect = await canonicalCpvList(sql, canonicalCtx);
-	const canonicalRelated = await canonicalRelatedList(sql, canonicalCtx, canonicalDirect.length);
+	const canonicalDirect = await timed(timingsMs, 'canonical_cpv', canonicalCpvList(sql, canonicalCtx));
+	const canonicalRelated = await timed(timingsMs, 'canonical_related', canonicalRelatedList(sql, canonicalCtx, canonicalDirect.length));
 
 	// Fase MCP-5.4 (heredado): "represas" volvía a colisionar con "REPRESENTACIONES..." la primera
 	// vez que se probó esto hoy - el tipeo de nombre corría SIEMPRE, sin las salvaguardas que esa
@@ -414,7 +432,7 @@ async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, p
 		experiencia.length > 0 ||
 		canonicalDirect.length > 0 ||
 		canonicalRelated.length > 0;
-	const nameTypo = hasConceptMatch ? [] : await nameTypoList(sql, phrase);
+	const nameTypo = hasConceptMatch ? [] : await timed(timingsMs, 'name_typo', nameTypoList(sql, phrase));
 
 	const namedLists: Record<EvidenceList, Evidence[]> = {
 		structured,
@@ -430,6 +448,7 @@ async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, p
 	};
 
 	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
+	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
 
 	for (const [listName, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
 		const weight = LIST_WEIGHTS[listName];
@@ -440,6 +459,14 @@ async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, p
 			seen.add(row.empresa_id);
 			rank++;
 			const contribution = weight / (RRF_K + rank);
+
+			// Fase 23B: guardar la contribución de ESTA señal para ESTA empresa, desagregada - el
+			// score final sigue siendo la suma (sin cambios de comportamiento), esto es puramente
+			// para poder mostrar el desglose en /debug-search.
+			const contributions = perEmpresaContributions.get(row.empresa_id) ?? {};
+			contributions[listName] = Math.round(contribution * 10000) / 10000;
+			perEmpresaContributions.set(row.empresa_id, contributions);
+
 			const existing = result.get(row.empresa_id);
 			if (!existing) {
 				result.set(row.empresa_id, { score: contribution, matchType: MATCH_TYPE_BY_LIST[listName], matchedVia: row.label });
@@ -457,7 +484,7 @@ async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, p
 		}
 	}
 
-	return { namedLists, canonicalCtx, result };
+	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs };
 }
 
 /**
@@ -484,17 +511,19 @@ export async function resolvePhraseEvidence(
  * por `lexical_taxonomy`/`taxonomy` (riesgo aceptado y documentado, ver docblock de este archivo).
  */
 export async function debugCanonicalSearch(sql: ReturnType<typeof getSql>, env: Env, phrase: string) {
-	const { namedLists, canonicalCtx, result } = await computePhraseEvidence(sql, env, phrase);
+	const { namedLists, canonicalCtx, result, timingsMs } = await computePhraseEvidence(sql, env, phrase);
 
 	const candidateCountBySource = Object.fromEntries(
 		(Object.entries(namedLists) as [EvidenceList, Evidence[]][]).map(([list, rows]) => [list, new Set(rows.map((r) => r.empresa_id)).size])
 	);
+	const candidatesRawTotal = (Object.values(namedLists) as Evidence[][]).reduce((sum, rows) => sum + rows.length, 0);
 
 	const fallbackLevelUsed: 'none' | 'L0_L3_direct' | 'L5_family_fallback' =
 		namedLists.canonical_cpv.length > 0 ? 'L0_L3_direct' : namedLists.canonical_related.length > 0 ? 'L5_family_fallback' : 'none';
 
 	return {
 		original_query: canonicalCtx.originalQuery,
+		normalized_query: canonicalCtx.normalizedTerm,
 		detected_intent: canonicalCtx.detectedIntent,
 		regional_terms: canonicalCtx.regionalTerms,
 		canonical_concepts: canonicalCtx.canonicalConcepts,
@@ -502,10 +531,44 @@ export async function debugCanonicalSearch(sql: ReturnType<typeof getSql>, env: 
 		cpv_relations: canonicalCtx.matches.map((m) => ({ level: m.level, cpv_code: m.cpvCode, weight: m.weight, via_term: m.viaTerm })),
 		candidate_sources: Object.keys(namedLists).filter((list) => candidateCountBySource[list] > 0),
 		candidate_count_by_source: candidateCountBySource,
+		candidates_before_dedup: candidatesRawTotal,
 		deduplicated_candidate_count: result.size,
 		fallback_level_used: fallbackLevelUsed,
+		early_stop_triggered: false as const,
 		final_count: result.size,
+		timings_ms: timingsMs,
+		diagnostic_flags: buildDiagnosticFlags(canonicalCtx, namedLists),
 	};
+}
+
+/**
+ * Fase 23B: banderas de diagnóstico derivadas SOLO de datos ya calculados en esta misma corrida -
+ * nunca una heurística nueva ni una consulta adicional. Ver plan de Fase 23B, sección "DIAGNOSTIC
+ * FLAGS" para el razonamiento de cada una.
+ */
+function buildDiagnosticFlags(canonicalCtx: CanonicalSearchContext, namedLists: Record<EvidenceList, Evidence[]>): string[] {
+	const flags: string[] = [];
+
+	const hasRegionalOrConcept = canonicalCtx.regionalTerms.length > 0 || canonicalCtx.canonicalConcepts.length > 0;
+	if (hasRegionalOrConcept && canonicalCtx.matches.length === 0) {
+		flags.push('CANONICAL_TERM_WITHOUT_CPV');
+	}
+	if (canonicalCtx.directCpvCodes.length > 0 && namedLists.canonical_cpv.length === 0) {
+		flags.push('CPV_WITHOUT_COMPANIES');
+	}
+	if (canonicalCtx.matches.length > 0 && namedLists.canonical_cpv.length === 0 && namedLists.canonical_related.length === 0) {
+		flags.push('EXPANSION_NOT_PROPAGATED');
+	}
+
+	const canonicalCompanies = new Set(namedLists.canonical_cpv.map((r) => r.empresa_id));
+	const overlapWithOldTaxonomy = namedLists.lexical_taxonomy.some((r) => canonicalCompanies.has(r.empresa_id)) || namedLists.taxonomy.some((r) => canonicalCompanies.has(r.empresa_id));
+	if (canonicalCompanies.size > 0 && overlapWithOldTaxonomy) {
+		flags.push('POSSIBLE_DOUBLE_COUNTING');
+	}
+
+	if (flags.length === 0) flags.push('NO_ISSUES_DETECTED');
+
+	return flags;
 }
 
 /** Empresas con al menos una coincidencia estructurada/léxica directa (substring) para esta frase - usado para decidir el límite final de salida, mismo criterio de "un match literal nunca es ruido a recortar" que ya usaba el nivel EXACTO del sistema anterior (Fase MCP-4.9). */
