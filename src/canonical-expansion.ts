@@ -70,6 +70,15 @@ export type CanonicalSearchContext = {
 	// Evidence de `canonical_cpv`/`canonical_related` con el tipo de relación real que la originó, sin
 	// tener que volver a tocar `taxonomy_term_cpv_relations` - ya viene resuelto acá.
 	relationTypeByCpv: Record<string, string | null>;
+	// Fase 24, Fase 2 (evidence layering): el weight que tendría el fallback L5 (level5_fallback_penalty),
+	// SIEMPRE presente cuando `relatedCpvCodes` no está vacío - independiente de si ese weight alcanzó
+	// `minimum_expansion_confidence` (el gate que decide si el L5 entra a `matches`, un gate DISTINTO
+	// y ya existente desde Fase 23A). `canonicalRelatedList` (hybrid-search.ts) necesita este valor
+	// para su propio gate (`minimum_relation_confidence`) sin depender de que el otro gate haya
+	// pasado - antes de este campo, un `minimum_relation_confidence` > 0 rompía canonical_related en
+	// TODOS los casos, porque `matches` casi nunca lleva una entrada L5 bajo los defaults actuales
+	// (0.30 < 0.50, ver bug encontrado probando esto contra "cabria").
+	relatedWeight: number;
 };
 
 /**
@@ -144,7 +153,12 @@ const SETTINGS_CACHE_TTL_MS = 60_000;
  * Workers se reutiliza entre invocaciones, así que esto evita una consulta a `taxonomy_settings` en
  * cada búsqueda sin necesitar KV/Durable Objects (ver punto 21 del pedido: performance).
  */
-async function loadSettings(sql: Sql): Promise<Record<string, string>> {
+// Fase 24, Fase 2 (evidence layering): exportadas para que `hybrid-search.ts` pueda leer los NUEVOS
+// settings de `canonical_related` (`related_candidates_parallel_enabled`/`max_related_candidates`/
+// `minimum_relation_confidence`/`generic_relation_penalty`) sin reimplementar el cache/parseo - el
+// cache es a nivel de módulo (`settingsCache` arriba), así que una segunda llamada desde otro archivo
+// dentro de la misma invocación es un cache hit, no una query nueva.
+export async function loadSettings(sql: Sql): Promise<Record<string, string>> {
 	if (settingsCache && settingsCache.expiresAt > Date.now()) {
 		return settingsCache.values;
 	}
@@ -159,13 +173,13 @@ async function loadSettings(sql: Sql): Promise<Record<string, string>> {
 	return values;
 }
 
-function flagEnabled(settings: Record<string, string>, key: string, defaultValue: boolean): boolean {
+export function flagEnabled(settings: Record<string, string>, key: string, defaultValue: boolean): boolean {
 	const raw = settings[key];
 	if (raw === undefined) return defaultValue;
 	return raw === '1' || raw === '1.0000' || raw.startsWith('1.');
 }
 
-function weightOf(settings: Record<string, string>, key: string, defaultValue: number): number {
+export function weightOf(settings: Record<string, string>, key: string, defaultValue: number): number {
 	const raw = settings[key];
 	if (raw === undefined) return defaultValue;
 	const parsed = parseFloat(raw);
@@ -360,6 +374,7 @@ export async function resolveCanonicalQueryWithSql(sql: Sql, phrase: string): Pr
 		directCpvCodes,
 		relatedCpvCodes: relatedOnly,
 		relationTypeByCpv,
+		relatedWeight: relatedOnly.length > 0 ? Math.round(level5Penalty * 100) / 100 : 0,
 		expansionConfidence: matches.length > 0 ? Math.max(...matches.map((m) => m.weight)) : 0,
 	};
 }
@@ -375,6 +390,7 @@ function emptyContext(phrase: string, normalizedTerm: string, intent: DetectedIn
 		directCpvCodes: [],
 		relatedCpvCodes: [],
 		relationTypeByCpv: {},
+		relatedWeight: 0,
 		expansionConfidence: 0,
 	};
 }

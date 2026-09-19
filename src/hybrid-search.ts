@@ -1,7 +1,7 @@
 import type { Env } from './index';
 import { getSql } from './db';
 import { extractEmbeddingVectors } from './taxonomy-tools';
-import { resolveCanonicalQueryWithSql, type CanonicalSearchContext } from './canonical-expansion';
+import { resolveCanonicalQueryWithSql, loadSettings, flagEnabled, weightOf, type CanonicalSearchContext } from './canonical-expansion';
 
 /**
  * Fase MCP-7 (Fase A, ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): reemplaza el
@@ -341,14 +341,45 @@ async function canonicalCpvList(sql: ReturnType<typeof getSql>, ctx: CanonicalSe
 }
 
 /**
- * Fase 23A: fallback L5 - solo si `canonicalCpvList` no encontró NINGUNA empresa para esta frase
- * (decisión en TypeScript, no una segunda consulta condicional - `relatedCpvCodes` ya vino en la
- * MISMA consulta de `resolveCanonicalQueryWithSql`). Tag distinto (`canonical_related_candidate` en
- * `MATCH_TYPE_BY_LIST`) para que la respuesta final pueda distinguir DIRECT_MATCH de
- * RELATED_CANDIDATE - nunca se presenta con la misma certeza.
+ * Fase 23A: fallback L5 por defecto - Fase 24/Fase 2 (evidence layering) agrega un modo alternativo,
+ * detrás de `mcp_canonical.related_candidates_parallel_enabled` (default OFF - preserva el
+ * comportamiento actual hasta que se confirme con benchmark, ver Fase 9 punto 11 del pedido):
+ *
+ * - OFF (default): comportamiento SIN CAMBIOS de Fase 23A - `canonical_related` solo corre si
+ *   `canonicalCpvList` no encontró NINGUNA empresa para esta frase (fallback puro).
+ * - ON: `canonical_related` corre SIEMPRE que haya `relatedCpvCodes` (coexiste con evidencia directa
+ *   - "ambas evidencias pueden coexistir", punto 6 del pedido de Fase 24), pero con 3 guardas nuevas
+ *   contra explosión de recall (punto 9), NINGUNA hardcodeada por término:
+ *     - `minimum_relation_confidence`: el match L5 que originó `relatedCpvCodes` debe tener weight
+ *       >= este umbral (`ctx.matches` ya trae el weight de cada nivel, incl. L5_family_fallback).
+ *     - `max_related_candidates`: tope duro de empresas que esta señal puede aportar por frase.
+ *     - `generic_relation_penalty`: multiplicador adicional sobre `LIST_WEIGHTS.canonical_related`
+ *       en la fusión RRF (aplicado en `computePhraseEvidence`, no acá - ahí es donde vive el peso).
+ *   `max_relation_depth` (mencionado en el pedido) no es un parámetro vivo todavía: la única
+ *   expansión relacionada implementada es UN salto de `taxonomy_categories.parent_id` (Family
+ *   inmediata, ver `canonical-expansion.ts`) - la profundidad está acotada por la propia SQL, no por
+ *   un contador en runtime. Agregar un setting que nada en el código respeta sería más engañoso que
+ *   útil - queda documentado acá para cuando exista expansión multi-salto real (L4, deliberadamente
+ *   sin implementar, ver docblock de `canonical-expansion.ts`).
+ *
+ * Tag distinto (`canonical_related_candidate` en `MATCH_TYPE_BY_LIST`) para que la respuesta final
+ * pueda distinguir DIRECT_MATCH de RELATED_CANDIDATE - nunca se presenta con la misma certeza, y
+ * `classifyEvidence` (Fase 24) nunca la asciende a LITERAL_MATCH solo por sobrevivir al ranking.
  */
-async function canonicalRelatedList(sql: ReturnType<typeof getSql>, ctx: CanonicalSearchContext, directHits: number): Promise<Evidence[]> {
-	if (directHits > 0 || ctx.relatedCpvCodes.length === 0) return [];
+async function canonicalRelatedList(
+	sql: ReturnType<typeof getSql>,
+	ctx: CanonicalSearchContext,
+	directHits: number,
+	settings: Record<string, string>
+): Promise<Evidence[]> {
+	const parallelEnabled = flagEnabled(settings, 'mcp_canonical.related_candidates_parallel_enabled', false);
+	if (!parallelEnabled && directHits > 0) return [];
+	if (ctx.relatedCpvCodes.length === 0) return [];
+
+	if (parallelEnabled) {
+		const minRelationConfidence = weightOf(settings, 'mcp_canonical.minimum_relation_confidence', 0.3);
+		if (ctx.relatedWeight < minRelationConfidence) return [];
+	}
 
 	const rows = await sql<{ empresa_id: number; cpv_code: string }[]>`
 		select distinct etc.empresa_id, tc.code as cpv_code
@@ -360,7 +391,10 @@ async function canonicalRelatedList(sql: ReturnType<typeof getSql>, ctx: Canonic
 	const byEmpresa = new Map<number, string>();
 	for (const r of rows) if (!byEmpresa.has(r.empresa_id)) byEmpresa.set(r.empresa_id, r.cpv_code);
 
-	return Array.from(byEmpresa.entries()).map(([empresa_id, cpvCode]) => ({
+	const maxRelatedCandidates = parallelEnabled ? weightOf(settings, 'mcp_canonical.max_related_candidates', 5) : Infinity;
+	const entries = Array.from(byEmpresa.entries()).slice(0, maxRelatedCandidates);
+
+	return entries.map(([empresa_id, cpvCode]) => ({
 		empresa_id,
 		label: `candidato relacionado con "${ctx.originalQuery}"${conceptLabel} - no es coincidencia directa`,
 		// Casi siempre null: un código de familia (fallback L5) rara vez coincide con el `cpv_code`
@@ -482,8 +516,13 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 	// DESPUÉS del Promise.all de arriba, no dentro. Nunca agrega una consulta si `resolveCanonicalQuery`
 	// no encontró ningún concepto para esta frase (`canonicalCpvList`/`canonicalRelatedList` retornan
 	// [] sin tocar la base cuando `directCpvCodes`/`relatedCpvCodes` vienen vacíos).
+	// Fase 24, Fase 2: `loadSettings` es un cache de módulo (canonical-expansion.ts) - ya se llamó
+	// dentro de `resolveCanonicalQueryWithSql` más arriba, así que esto es un cache hit, no una query
+	// nueva. Necesario acá para leer `generic_relation_penalty` (aplicado más abajo, en la fusión RRF)
+	// y para pasarle a `canonicalRelatedList` el resto de los settings de evidence layering.
+	const settings = await loadSettings(sql);
 	const canonicalDirect = await timed(timingsMs, 'canonical_cpv', canonicalCpvList(sql, canonicalCtx));
-	const canonicalRelated = await timed(timingsMs, 'canonical_related', canonicalRelatedList(sql, canonicalCtx, canonicalDirect.length));
+	const canonicalRelated = await timed(timingsMs, 'canonical_related', canonicalRelatedList(sql, canonicalCtx, canonicalDirect.length, settings));
 
 	// Fase MCP-5.4 (heredado): "represas" volvía a colisionar con "REPRESENTACIONES..." la primera
 	// vez que se probó esto hoy - el tipeo de nombre corría SIEMPRE, sin las salvaguardas que esa
@@ -517,9 +556,17 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 
 	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
 	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
+	// Fase 24, Fase 2 (evidence layering, punto 9 del pedido): multiplicador GENERAL adicional sobre
+	// el peso de `canonical_related` en la fusión RRF - independiente de `level5_fallback_penalty`
+	// (que ya descuenta el weight de CADA match L5 dentro de `canonical-expansion.ts`). Da un segundo
+	// dial: cuánto confiar en la SEÑAL completa de relacionados frente a las demás señales, sin tocar
+	// el peso de otras listas. Default 1.0 - sin penalización adicional, preserva el comportamiento
+	// actual mientras `related_candidates_parallel_enabled` esté OFF (canonical_related casi siempre
+	// vacío en ese modo, así que el multiplicador no tiene nada que multiplicar).
+	const genericRelationPenalty = weightOf(settings, 'mcp_canonical.generic_relation_penalty', 1.0);
 
 	for (const [listName, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
-		const weight = LIST_WEIGHTS[listName];
+		const weight = listName === 'canonical_related' ? LIST_WEIGHTS[listName] * genericRelationPenalty : LIST_WEIGHTS[listName];
 		const seen = new Set<number>();
 		let rank = 0;
 		for (const row of rows) {
