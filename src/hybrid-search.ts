@@ -148,7 +148,55 @@ export const MATCH_TYPE_BY_LIST: Record<EvidenceList, string> = {
 	canonical_related: 'canonical_related_candidate',
 };
 
-export type Evidence = { empresa_id: number; label: string };
+export type Evidence = {
+	empresa_id: number;
+	label: string;
+	// Fase 24 (corrección de causa raíz H): descriptor de CALIDAD del mapping término↔CPV que originó
+	// esta evidencia (exact/strong_lexical/lexical/contextual/explicit_synonym - ver
+	// taxonomy_term_cpv_relations.relation_type), solo presente para evidencia de `canonical_cpv`/
+	// `canonical_related`. NUNCA reinterpretado como relación ontológica (EQUIPMENT_FOR/USED_FOR/etc
+	// - esas no existen todavía) - se expone tal cual la guarda el Auto Mapper, sin adivinar semántica
+	// que esos ~9.700 mappings nunca tuvieron.
+	relationType?: string | null;
+};
+
+// Fase 24 (corrección de causa raíz I): ÚNICA definición de qué cuenta como evidencia "directa"
+// (coincidencia literal/estructurada, no inferida por taxonomía/semántica) - antes convivían dos
+// definiciones divergentes (`countDirectMatches` solo miraba `structuredList`; `debug-search.ts`
+// tenía su propia lista `directSources` que sí incluía `lexical_experiencia`/`fulltext`). Usada por
+// `classifyEvidence` (abajo) y por el reemplazo de `countDirectMatches` en `empresa-tools.ts`/
+// `debug-search.ts` - un solo lugar que editar si esta definición cambia.
+export const DIRECT_EVIDENCE_LISTS: ReadonlySet<EvidenceList> = new Set([
+	'structured',
+	'name_typo',
+	'lexical_experiencia',
+	'lexical_taxonomy',
+	'fulltext',
+]);
+
+export function isDirectEvidenceList(list: EvidenceList): boolean {
+	return DIRECT_EVIDENCE_LISTS.has(list);
+}
+
+export type EvidenceStrength = 'LITERAL_MATCH' | 'CPV_CAPABILITY' | 'RELATED_CAPABILITY' | 'TAXONOMY_INFERENCE' | 'SEMANTIC_INFERENCE';
+
+/**
+ * Fase 24 (corrección de causa raíz I, unifica lo que antes era `classifyEvidenceStrength` +
+ * `directSources` duplicados en `debug-search.ts`): ÚNICA función de clasificación de evidencia,
+ * usada por ranking/debug/conteos - nunca dos listas divergentes de qué significa "directo" o qué
+ * significa cada nivel de fuerza. Clasifica por LISTA DE ORIGEN (misma taxonomía ya usada desde Fase
+ * 23B), no todavía por `relationType` (deliberado - ver punto 4 del pedido: no reinterpretar
+ * `relation_type` como semántica ontológica hasta verificar cómo se generó; queda expuesto en
+ * `Evidence.relationType` para que el llamador lo muestre, sin que decida la clasificación aún).
+ */
+export function classifyEvidence(sources: EvidenceList[]): { isDirect: boolean; strength: EvidenceStrength } {
+	if (sources.some((list) => isDirectEvidenceList(list))) return { isDirect: true, strength: 'LITERAL_MATCH' };
+	if (sources.includes('canonical_cpv')) return { isDirect: false, strength: 'CPV_CAPABILITY' };
+	if (sources.includes('canonical_related')) return { isDirect: false, strength: 'RELATED_CAPABILITY' };
+	if (sources.includes('taxonomy')) return { isDirect: false, strength: 'TAXONOMY_INFERENCE' };
+	if (sources.includes('service') || sources.includes('experiencia')) return { isDirect: false, strength: 'SEMANTIC_INFERENCE' };
+	return { isDirect: false, strength: 'RELATED_CAPABILITY' };
+}
 
 export type FusedMatch = { empresa_id: number; score: number; matchType: string; matchedVia: string };
 
@@ -271,14 +319,25 @@ async function lexicalTaxonomyList(sql: ReturnType<typeof getSql>, phrase: strin
 async function canonicalCpvList(sql: ReturnType<typeof getSql>, ctx: CanonicalSearchContext): Promise<Evidence[]> {
 	if (ctx.directCpvCodes.length === 0) return [];
 
-	const rows = await sql<{ empresa_id: number }[]>`
-		select distinct etc.empresa_id
+	const rows = await sql<{ empresa_id: number; cpv_code: string }[]>`
+		select distinct etc.empresa_id, tc.code as cpv_code
 		from empresa_taxonomy_category etc
 		join taxonomy_categories tc on tc.id = etc.category_id
 		where tc.code in ${sql(ctx.directCpvCodes)}
 	`;
+	// Una empresa puede tener MÁS de uno de los `directCpvCodes` a la vez (ej. dos códigos hermanos
+	// de un mismo concepto tras el fix de Fase 24) - dedup por empresa acá, quedándose con el primer
+	// cpv_code visto, para no duplicar su fila dentro de ESTA MISMA lista (el `distinct etc.empresa_id`
+	// original ya lo garantizaba antes de que este fix agregara `tc.code` al select).
 	const conceptLabel = ctx.canonicalConcepts[0] ? ` (concepto: ${ctx.canonicalConcepts[0]})` : '';
-	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `coincide con "${ctx.originalQuery}" vía taxonomía CPV${conceptLabel}` }));
+	const byEmpresa = new Map<number, string>();
+	for (const r of rows) if (!byEmpresa.has(r.empresa_id)) byEmpresa.set(r.empresa_id, r.cpv_code);
+
+	return Array.from(byEmpresa.entries()).map(([empresa_id, cpvCode]) => ({
+		empresa_id,
+		label: `coincide con "${ctx.originalQuery}" vía taxonomía CPV${conceptLabel}`,
+		relationType: ctx.relationTypeByCpv[cpvCode] ?? null,
+	}));
 }
 
 /**
@@ -291,14 +350,23 @@ async function canonicalCpvList(sql: ReturnType<typeof getSql>, ctx: CanonicalSe
 async function canonicalRelatedList(sql: ReturnType<typeof getSql>, ctx: CanonicalSearchContext, directHits: number): Promise<Evidence[]> {
 	if (directHits > 0 || ctx.relatedCpvCodes.length === 0) return [];
 
-	const rows = await sql<{ empresa_id: number }[]>`
-		select distinct etc.empresa_id
+	const rows = await sql<{ empresa_id: number; cpv_code: string }[]>`
+		select distinct etc.empresa_id, tc.code as cpv_code
 		from empresa_taxonomy_category etc
 		join taxonomy_categories tc on tc.id = etc.category_id
 		where tc.code in ${sql(ctx.relatedCpvCodes)}
 	`;
 	const conceptLabel = ctx.canonicalConcepts[0] ? ` (familia relacionada con: ${ctx.canonicalConcepts[0]})` : '';
-	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `candidato relacionado con "${ctx.originalQuery}"${conceptLabel} - no es coincidencia directa` }));
+	const byEmpresa = new Map<number, string>();
+	for (const r of rows) if (!byEmpresa.has(r.empresa_id)) byEmpresa.set(r.empresa_id, r.cpv_code);
+
+	return Array.from(byEmpresa.entries()).map(([empresa_id, cpvCode]) => ({
+		empresa_id,
+		label: `candidato relacionado con "${ctx.originalQuery}"${conceptLabel} - no es coincidencia directa`,
+		// Casi siempre null: un código de familia (fallback L5) rara vez coincide con el `cpv_code`
+		// propio de algún término visto en esta consulta - se deja explícito en vez de forzar un valor.
+		relationType: ctx.relationTypeByCpv[cpvCode] ?? null,
+	}));
 }
 
 async function fullTextList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
@@ -571,10 +639,24 @@ export function buildDiagnosticFlags(canonicalCtx: CanonicalSearchContext, named
 	return flags;
 }
 
-/** Empresas con al menos una coincidencia estructurada/léxica directa (substring) para esta frase - usado para decidir el límite final de salida, mismo criterio de "un match literal nunca es ruido a recortar" que ya usaba el nivel EXACTO del sistema anterior (Fase MCP-4.9). */
-export async function countDirectMatches(sql: ReturnType<typeof getSql>, phrase: string): Promise<number> {
-	const rows = await structuredList(sql, phrase);
-	return new Set(rows.map((r) => r.empresa_id)).size;
+/**
+ * Fase 24 (corrección de causa raíz I del diagnóstico A-J): reemplaza `countDirectMatches`, que
+ * disparaba una consulta APARTE (`structuredList` solamente - nombre/servicio/sector) y por eso no
+ * contaba evidencia literal real que sí venía de `lexical_experiencia`/`fulltext` (ej. "gandolas"
+ * encontrando a CONSORCIO PALDACA por texto de experiencia - `direct_match_count` daba 0 mientras
+ * DEBUG sí mostraba `LITERAL_MATCH` para esa misma empresa, dos definiciones de "directo" sin
+ * reconciliar). Ahora deriva el conteo de `namedLists` que `computePhraseEvidence` YA calculó para
+ * esta frase - cero consultas nuevas, y usa la MISMA `DIRECT_EVIDENCE_LISTS` que `classifyEvidence`,
+ * así que nunca puede volver a divergir de lo que DEBUG reporta como evidencia directa. Cuenta
+ * EMPRESAS distintas (no evidencias) - mismo significado que ya tenía para decidir el límite final
+ * de salida (Fase MCP-4.9): "un match literal nunca es ruido a recortar".
+ */
+export function countDirectCompanies(namedLists: Record<EvidenceList, Evidence[]>): number {
+	const ids = new Set<number>();
+	for (const list of DIRECT_EVIDENCE_LISTS) {
+		for (const row of namedLists[list]) ids.add(row.empresa_id);
+	}
+	return ids.size;
 }
 
 /** Fusiona los mapas de score de varias frases (multi_concept) sumando contribuciones - mismo principio RRF, cada frase es una fuente de evidencia mas. */

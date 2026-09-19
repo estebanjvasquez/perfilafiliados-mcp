@@ -1,0 +1,43 @@
+{
+  "_comment": "Fase 24 (docs/taxonomia en PerfilAfiliadosCPV): fixtures de datos para scripts/regression-suite.mjs. Los términos concretos (gandola, cabria, balancín, etc.) son DATOS de prueba, nunca lógica del motor - ver premisa obligatoria del pedido de Fase 24. Grupo A = consultas que ya funcionaban antes de esta fase (docs/taxonomia/intent_eval_cases.md, solo los casos que no requieren clasificación de intención por el agente LLM de n8n). Grupo B = regionalismos reales de la taxonomía (taxonomy_terms.term_type IN ('regional_slang','regional_variant')), no solo gandola/cabria. Grupo C = matriz intent x subject, para confirmar que la actividad detectada nunca se hereda accidentalmente del concepto encontrado.",
+  "groups": {
+    "A_baseline": [
+      "represas",
+      "camiones",
+      "grua",
+      "ISO 9001",
+      "reciclaje",
+      "rehabilitacion de vialidad",
+      "tratamiento de aguas de perforacion",
+      "construccion"
+    ],
+    "B_regional": [
+      "gandola",
+      "gandolas",
+      "cabria",
+      "cabrias",
+      "mechurrio",
+      "macolla",
+      "guaya fina",
+      "guaya eléctrica",
+      "camión chupón",
+      "revestidor",
+      "mecha",
+      "caballito",
+      "balancín",
+      "levantamiento artificial"
+    ],
+    "C_intent_x_subject": [
+      "fabricantes de gandolas",
+      "mantenimiento de gandolas",
+      "alquiler de gandolas",
+      "transporte de gandolas",
+      "fabricantes de cabrias",
+      "mantenimiento de cabrias",
+      "fabricantes de balancines",
+      "mantenimiento de balancín",
+      "fabricantes de levantamiento artificial",
+      "mantenimiento de levantamiento artificial"
+    ]
+  }
+}

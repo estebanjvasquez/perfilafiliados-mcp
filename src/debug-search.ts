@@ -4,8 +4,10 @@ import {
 	computePhraseEvidence,
 	mergePhraseEvidence,
 	rankedIds,
-	countDirectMatches,
+	countDirectCompanies,
 	buildDiagnosticFlags,
+	classifyEvidence,
+	isDirectEvidenceList,
 	LIST_WEIGHTS,
 	MATCH_TYPE_BY_LIST,
 	type EvidenceList,
@@ -58,11 +60,11 @@ function buildReportShape(input: {
 	phraseDetails: { phrase: string; detail: PhraseEvidenceDetail }[];
 	empresasById: Map<number, EmpresaRow>;
 	ranked: { empresa_id: number; score: number; matchType: string; matchedVia: string }[];
-	directMatchCount: number;
+	directCompanyCount: number;
 	crawlerSystemWideTotal: number;
 	totalMs: number;
 }) {
-	const { debugId, query, resolvedPhrases, phraseDetails, empresasById, ranked, directMatchCount, crawlerSystemWideTotal, totalMs } = input;
+	const { debugId, query, resolvedPhrases, phraseDetails, empresasById, ranked, directCompanyCount, crawlerSystemWideTotal, totalMs } = input;
 
 	// Fase 23B: une la expansión canónica y los conteos de candidatos de TODAS las frases (query +
 	// resolvedPhrases) - mismo criterio que `mergePhraseEvidence` ya aplica al score: cada frase es
@@ -113,8 +115,10 @@ function buildReportShape(input: {
 			// docblock de esa función). Se etiqueta `source` explícitamente por transparencia.
 			detected_intent: phraseDetails[0]?.detail.canonicalCtx.detectedIntent ?? 'generic',
 			intent_source: 'RULE' as const,
+			// Fase 24 (corrección de causa raíz E): ahora viene de `taxonomy_terms.term_type`
+			// (regional_slang/regional_variant), no de si la búsqueda matcheó una alias string.
 			regional_terms: regionalTerms,
-			regional_terms_source: 'TAXONOMY' as const,
+			regional_terms_source: 'TAXONOMY.term_type' as const,
 			canonical_concepts: canonicalConcepts,
 		},
 		mcp_payload_real: {
@@ -123,6 +127,10 @@ function buildReportShape(input: {
 			query,
 			resolvedPhrases,
 		},
+		// Fase 24 (corrección de causas raíz D/E/G/H): se agregan `regions`/`term_type`/`is_alias`
+		// (antes invisibles pese a existir en el schema) y `mapping_relation_type` (calidad del
+		// mapping término↔CPV real - exact/lexical/contextual/etc., NUNCA una relación ontológica
+		// inventada, ver docblock de `CanonicalTermMatch`).
 		canonical_expansion_table: allMatches.map((m) => ({
 			term: m.term,
 			type: m.level,
@@ -131,8 +139,19 @@ function buildReportShape(input: {
 			source: m.viaTerm ? 'taxonomy_term_concepts' : 'taxonomy_term_cpv_relations',
 			via_term: m.viaTerm,
 			phrase: m.phrase,
+			regions: m.regions,
+			term_type: m.termType,
+			is_alias: m.isAlias,
+			mapping_relation_type: m.mappingRelationType,
 		})),
-		cpv_relations: allMatches.map((m) => ({ cpv_code: m.cpvCode, level: m.level, weight: m.weight, via_term: m.viaTerm, status: 'approved' as const })),
+		cpv_relations: allMatches.map((m) => ({
+			cpv_code: m.cpvCode,
+			level: m.level,
+			weight: m.weight,
+			via_term: m.viaTerm,
+			status: 'approved' as const,
+			mapping_relation_type: m.mappingRelationType,
+		})),
 		candidate_generation: {
 			candidates_by_signal: candidateCountBySource,
 			candidates_before_dedup: candidatesBeforeDedup,
@@ -157,7 +176,10 @@ function buildReportShape(input: {
 			signal_functions_run: phraseDetails.length * Object.keys(phraseDetails[0]?.detail.namedLists ?? {}).length,
 			cache: 'not implemented',
 		},
-		direct_match_count: directMatchCount,
+		// Fase 24 (corrección de causa raíz I): renombrado desde `direct_match_count` - el nombre viejo
+		// era ambiguo (¿empresas o evidencias?) y además contaba mal (ver `countDirectCompanies`).
+		// Cuenta EMPRESAS distintas con evidencia directa de la frase raíz (`query`).
+		direct_company_count: directCompanyCount,
 	};
 }
 
@@ -192,11 +214,26 @@ function buildCandidateDetail(
 		}
 	}
 
-	const directSources: EvidenceList[] = ['structured', 'lexical_experiencia', 'lexical_taxonomy', 'fulltext', 'name_typo'];
-	const directEvidence = evidenceBySource.filter((e) => directSources.includes(e.source));
-	const inferredEvidence = evidenceBySource.filter((e) => !directSources.includes(e.source));
+	// Fase 24 (corrección de causa raíz I): antes esta lista vivía duplicada acá (`directSources`) Y
+	// en `classifyEvidenceStrength` (más abajo, ahora eliminada) con criterios ligeramente distintos
+	// para `name_typo` - una la contaba como directa, la otra no. `isDirectEvidenceList`/
+	// `classifyEvidence` (hybrid-search.ts) son ahora la ÚNICA definición, compartida también por
+	// `countDirectCompanies`.
+	const directEvidence = evidenceBySource.filter((e) => isDirectEvidenceList(e.source));
+	const inferredEvidence = evidenceBySource.filter((e) => !isDirectEvidenceList(e.source));
 
-	const evidenceStrength = classifyEvidenceStrength(evidenceBySource.map((e) => e.source));
+	// Fase 24: `mapping_relation_type` real (exact/lexical/contextual/etc.) de la evidencia canónica,
+	// si la hay - expuesto tal cual, nunca reinterpretado (ver causa raíz H).
+	const mappingRelationTypes = Array.from(
+		new Set(
+			phraseDetails
+				.flatMap(({ detail }) => [...detail.namedLists.canonical_cpv, ...detail.namedLists.canonical_related])
+				.filter((e) => e.empresa_id === ranked.empresa_id && e.relationType)
+				.map((e) => e.relationType as string)
+		)
+	);
+
+	const { strength: evidenceStrength } = classifyEvidence(evidenceBySource.map((e) => e.source));
 	const whyIncluded = buildWhyIncluded(evidenceBySource, evidenceStrength);
 
 	return {
@@ -209,22 +246,11 @@ function buildCandidateDetail(
 		evidence_sources: Array.from(new Set(evidenceBySource.map((e) => e.source))),
 		score_breakdown: scoreBreakdown,
 		evidence_strength: evidenceStrength,
+		mapping_relation_types: mappingRelationTypes,
 		direct_match: directEvidence.length > 0 ? directEvidence.map((e) => e.label) : ['none'],
 		inferred_match: inferredEvidence.length > 0 ? inferredEvidence.map((e) => e.label) : ['none'],
 		why_included: whyIncluded,
 	};
-}
-
-function classifyEvidenceStrength(sources: EvidenceList[]): string {
-	if (sources.includes('structured') || sources.includes('lexical_experiencia') || sources.includes('lexical_taxonomy') || sources.includes('fulltext')) {
-		return 'LITERAL_MATCH';
-	}
-	if (sources.includes('canonical_cpv')) return 'CPV_CAPABILITY';
-	if (sources.includes('canonical_related')) return 'RELATED_CAPABILITY';
-	if (sources.includes('taxonomy')) return 'TAXONOMY_INFERENCE';
-	if (sources.includes('service') || sources.includes('experiencia')) return 'SEMANTIC_INFERENCE';
-	if (sources.includes('name_typo')) return 'RELATED_CAPABILITY';
-	return 'RELATED_CAPABILITY';
 }
 
 /** Fase 23B (punto 40 del pedido): armada por plantilla a partir de evidencia real, NUNCA por un LLM. */
@@ -271,7 +297,11 @@ export async function resolveDebugSearch(env: Env, query: string, resolvedPhrase
 
 		const fusedEvidence = mergePhraseEvidence(phraseDetails.map(({ detail }) => detail.result));
 		const ranked = rankedIds(fusedEvidence);
-		const directMatchCount = await countDirectMatches(sql, phrases[0]);
+		// Fase 24: mismo `countDirectCompanies` que ahora usa `empresa-tools.ts` - antes `countDirectMatches`
+		// solo miraba `structuredList` (nombre/servicio/sector), una definición de "directo" distinta de
+		// la que este mismo archivo ya usaba para etiquetar `LITERAL_MATCH` (`directSources` en
+		// `buildCandidateDetail`, más abajo) - unificado acá vía `DIRECT_EVIDENCE_LISTS`.
+		const directCompanyCount = countDirectCompanies(phraseDetails[0].detail.namedLists);
 
 		const empresasById = new Map<number, EmpresaRow>();
 		if (ranked.length > 0) {
@@ -288,7 +318,7 @@ export async function resolveDebugSearch(env: Env, query: string, resolvedPhrase
 			phraseDetails,
 			empresasById,
 			ranked,
-			directMatchCount,
+			directCompanyCount,
 			crawlerSystemWideTotal: crawlerTotal,
 			totalMs: performance.now() - start,
 		});

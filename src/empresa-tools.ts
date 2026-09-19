@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
-import { resolvePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectMatches, debugCanonicalSearch } from './hybrid-search';
+import { computePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectCompanies, debugCanonicalSearch } from './hybrid-search';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -457,16 +457,21 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				// sumar `query` como una frase más no tiene costo cuando ya coincide con resolvedPhrases,
 				// y rescata la evidencia cuando no coincide.
 				const phrases = Array.from(new Set([query, ...(resolvedPhrases ?? [])]));
-				const evidenceMaps = await Promise.all(phrases.map((phrase) => resolvePhraseEvidence(sql, env, phrase)));
-				const fusedEvidence = mergePhraseEvidence(evidenceMaps);
+				// Fase 24: `computePhraseEvidence` reemplaza a `resolvePhraseEvidence` acá (mismas queries,
+				// mismo costo - ver docblock de esa función) para poder derivar `directCompanyCount` de los
+				// `namedLists` de la frase raíz (`phrases[0]` = `query`) sin una consulta aparte (antes
+				// `countDirectMatches` volvía a golpear la BD solo para `structuredList`, y con una
+				// definición de "directo" más angosta que la que ya usa DEBUG - ver `countDirectCompanies`).
+				const phraseDetails = await Promise.all(phrases.map((phrase) => computePhraseEvidence(sql, env, phrase)));
+				const fusedEvidence = mergePhraseEvidence(phraseDetails.map((d) => d.result));
 				const ranked = rankedIds(fusedEvidence);
 
 				if (ranked.length === 0) {
 					return { content: [{ type: 'text' as const, text: JSON.stringify([], null, 2) }] };
 				}
 
-				const directMatchCount = await countDirectMatches(sql, phrases[0]);
-				const effectiveLimit = directMatchCount > max ? exactMax : max;
+				const directCompanyCount = countDirectCompanies(phraseDetails[0].namedLists);
+				const effectiveLimit = directCompanyCount > max ? exactMax : max;
 
 				const candidateIds = ranked.map((r) => r.empresa_id);
 				const conditions = [sql`e.status_id = 1`, sql`e.id in ${sql(candidateIds)}`, ...structuredFilters()];
