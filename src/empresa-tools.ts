@@ -422,6 +422,23 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				return conditions;
 			}
 
+			/**
+			 * Etiqueta legible de los filtros estructurados activos, para `matched_via`.
+			 *
+			 * Vale para las DOS rutas (filtro puro e híbrida): en la híbrida la evidencia de texto libre
+			 * explica por qué la empresa rankeó, pero no que además pasó el filtro de ciudad/sector - y
+			 * sin eso una búsqueda correcta se le presenta al usuario con una justificación que parece
+			 * irrelevante ("coincide en texto con 'empresas'" para una búsqueda por estado que sí filtró
+			 * bien por Zulia).
+			 */
+			const structuredLabel = [
+				sector ? `sector: ${sector}` : null,
+				ciudad ? `ciudad o estado: ${ciudad}` : null,
+				categoria_codigo ? `categoría CPV: ${categoria_codigo}` : null,
+			]
+				.filter((p): p is string => !!p)
+				.join(' · ');
+
 			try {
 				// Sin "query": filtro estructurado puro (sector/ciudad/categoria_codigo) - no hay texto
 				// libre que interpretar, no hace falta el buscador híbrido.
@@ -434,14 +451,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						order by e.name
 						limit ${exactMax}
 					`;
-					const matchedVia = [
-						sector ? `sector: ${sector}` : null,
-						ciudad ? `ciudad o estado: ${ciudad}` : null,
-						categoria_codigo ? `categoría CPV: ${categoria_codigo}` : null,
-					]
-						.filter((p): p is string => !!p)
-						.join(' · ');
-					const tagged = rows.map((r) => ({ ...r, match_type: 'exact' as const, matched_via: matchedVia }));
+					const tagged = rows.map((r) => ({ ...r, match_type: 'exact' as const, matched_via: structuredLabel }));
 					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 				}
 
@@ -486,8 +496,9 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				const tagged = rows
 					.map((r) => {
 						const evidence = evidenceByEmpresaId.get(r.id);
+						const matchedVia = [evidence?.matchedVia, structuredLabel].filter((p): p is string => !!p).join(' · ');
 						return {
-							row: { ...r, match_type: evidence?.matchType ?? 'exact', matched_via: evidence?.matchedVia ?? '' },
+							row: { ...r, match_type: evidence?.matchType ?? 'exact', matched_via: matchedVia },
 							score: evidence?.score ?? 0,
 						};
 					})
