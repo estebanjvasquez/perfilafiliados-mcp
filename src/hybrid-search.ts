@@ -219,7 +219,7 @@ export async function embedPhrase(env: Env, phrase: string): Promise<string | nu
 // encuentra a DIMACA de todas formas por su nombre indexado - sin pérdida neta. Servicio/sector NO
 // llevan este mínimo: son catálogos curados y acotados (112/8 entradas), sin el riesgo de razones
 // sociales libres que sí tiene `empresas.name`.
-const NAME_SUBSTRING_MIN_LENGTH = 7;
+export const NAME_SUBSTRING_MIN_LENGTH = 7;
 
 async function structuredList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
 	const like = '%' + phrase + '%';

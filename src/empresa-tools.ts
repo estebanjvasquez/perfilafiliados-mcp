@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
 import { computePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectCompanies, debugCanonicalSearch } from './hybrid-search';
+import { buildExplanations } from './search-explain';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -352,6 +353,15 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							'busca por separado y se combinan los resultados). Si no llamaste a resolve_search_intent, ' +
 							'omitilo - "query" solo sigue funcionando igual que siempre.'
 					),
+				explain: z
+					.boolean()
+					.optional()
+					.describe(
+						'Uso de presentación (CIRA de pruebas): si es true, cada empresa trae además "explain" con ' +
+							'las fuentes que la encontraron (nombre, servicio, sector, experiencia, taxonomía CPV, texto ' +
+							'del perfil...), el aporte de cada una y el puntaje con el que quedó ordenada. No cambia el ' +
+							'orden, el corte ni los resultados.'
+					),
 				debug: z
 					.boolean()
 					.optional()
@@ -362,7 +372,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					),
 			},
 		},
-		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases, debug }) => {
+		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases, explain, debug }) => {
 			if (!query && !sector && !ciudad && !categoria_codigo) {
 				return {
 					content: [
@@ -441,7 +451,22 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					]
 						.filter((p): p is string => !!p)
 						.join(' · ');
-					const tagged = rows.map((r) => ({ ...r, match_type: 'exact' as const, matched_via: matchedVia }));
+					const tagged = rows.map((r, i) => ({
+						...r,
+						match_type: 'exact' as const,
+						matched_via: matchedVia,
+						...(explain
+							? {
+									explain: {
+										posicion: i + 1,
+										puntaje: null,
+										puntaje_relativo: null,
+										fuentes: [{ fuente: 'Filtro', tipo: 'coincide', detalle: matchedVia }],
+										formula: 'sin texto libre: filtro estructurado, orden alfabético',
+									},
+								}
+							: {}),
+					}));
 					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
 				}
 
@@ -492,10 +517,22 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 						};
 					})
 					.sort((a, b) => b.score - a.score)
-					.slice(0, effectiveLimit)
-					.map((c) => c.row);
+					.slice(0, effectiveLimit);
 
-				return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+				if (!explain) {
+					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged.map((c) => c.row), null, 2) }] };
+				}
+
+				// TASK-0013: explicación por resultado, calculada DESPUÉS de ordenar y cortar - solo lee.
+				const explanations = await buildExplanations(
+					sql,
+					phrases,
+					phraseDetails,
+					tagged.map((c) => String(c.row.id)),
+					new Map(tagged.map((c) => [String(c.row.id), c.score]))
+				);
+				const withExplain = tagged.map((c) => ({ ...c.row, explain: explanations.get(String(c.row.id)) ?? null }));
+				return { content: [{ type: 'text' as const, text: JSON.stringify(withExplain, null, 2) }] };
 			} finally {
 				await sql.end({ timeout: 1 });
 			}
