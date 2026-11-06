@@ -25,6 +25,12 @@ const intOrNull = (v: unknown): number | null => {
 	return Number.isInteger(n) && n > 0 ? n : NaN;
 };
 
+/** Error de base: devuelve solo el código SQLSTATE y el mensaje de Postgres (sin datos ni credenciales). */
+function dbError(e: unknown): Response {
+	const err = e as { code?: string; message?: string };
+	return Response.json({ ok: false, error: 'db_error', code: err?.code ?? null, message: String(err?.message ?? e).slice(0, 300) }, { status: 500 });
+}
+
 function authorized(request: Request, env: Env): boolean {
 	return (request.headers.get('Authorization') ?? '') === `Bearer ${env.MCP_TOKEN}`;
 }
@@ -50,6 +56,8 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 	if (!SOURCES.has(source)) return bad('source inválido');
 
 	const ids = Array.isArray(b.result_empresa_ids) ? b.result_empresa_ids.map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 500) : [];
+	// Literal de arreglo de Postgres: los ids ya son enteros validados, no hay nada que escapar.
+	const idsLiteral = '{' + ids.join(',') + '}';
 	const responseMs = b.response_ms == null ? null : Math.max(0, Math.round(Number(b.response_ms)) || 0);
 
 	let evidence: string | null = null;
@@ -72,10 +80,12 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 			values
 				(${source}, ${str(b.session_ref, 200)}, ${str(b.visitor_ref, 200)}, ${str(b.n8n_execution_id, 100)},
 				 ${userInput}, ${str(b.agent_tool, 50)}, ${params}::jsonb, ${str(b.interpretation, 50)}, ${ids.length},
-				 ${ids}::bigint[], ${evidence}::jsonb, ${str(b.engine_version, 200)}, ${responseMs}, ${str(b.error, 2000)})
+				 ${idsLiteral}::bigint[], ${evidence}::jsonb, ${str(b.engine_version, 200)}, ${responseMs}, ${str(b.error, 2000)})
 			returning id
 		`;
 		return Response.json({ ok: true, id: Number(row.id) });
+	} catch (e) {
+		return dbError(e);
 	} finally {
 		await sql.end({ timeout: 1 });
 	}
@@ -113,14 +123,17 @@ export async function handleSearchFeedback(request: Request, env: Env): Promise<
 
 	const sql = getSql(env);
 	try {
-		const [log] = await sql<{ ids: string[] }[]>`select result_empresa_ids::text[] as ids from cira_search_log where id = ${logId}`;
+		// La posición la calcula Postgres: por Hyperdrive el arreglo puede llegar como texto.
+		const [log] = await sql<{ pos: number | null }[]>`
+			select array_position(result_empresa_ids, ${empresaId ?? 0}::bigint) as pos
+			from cira_search_log where id = ${logId}
+		`;
 		if (!log) return bad('búsqueda no encontrada', 404);
 
 		let rank: number | null = null;
 		if (empresaId) {
-			const idx = log.ids.indexOf(String(empresaId));
-			if (idx < 0) return bad('la empresa no está en los resultados de esa búsqueda', 422);
-			rank = idx + 1;
+			if (log.pos == null) return bad('la empresa no está en los resultados de esa búsqueda', 422);
+			rank = Number(log.pos);
 		}
 
 		const [row] = await sql<{ id: string; inserted: boolean }[]>`
@@ -132,6 +145,8 @@ export async function handleSearchFeedback(request: Request, env: Env): Promise<
 			returning id, (xmax = 0) as inserted
 		`;
 		return Response.json({ ok: true, id: Number(row.id), updated: !row.inserted, rank_position: rank });
+	} catch (e) {
+		return dbError(e);
 	} finally {
 		await sql.end({ timeout: 1 });
 	}
