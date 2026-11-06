@@ -60,16 +60,12 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 	const idsLiteral = '{' + ids.join(',') + '}';
 	const responseMs = b.response_ms == null ? null : Math.max(0, Math.round(Number(b.response_ms)) || 0);
 
-	let evidence: string | null = null;
-	if (b.result_evidence != null) {
-		evidence = JSON.stringify(b.result_evidence);
-		if (evidence.length > 200_000) evidence = JSON.stringify({ truncated: true });
-	}
-	let params: string | null = null;
-	if (b.agent_params != null) {
-		params = JSON.stringify(b.agent_params);
-		if (params.length > 20_000) params = JSON.stringify({ truncated: true });
-	}
+	// JSON: se pasa el objeto con sql.json() (con un string + ::jsonb, postgres.js lo serializa dos
+	// veces y queda guardado como un escalar de texto).
+	const capped = (v: unknown, max: number): unknown =>
+		v == null ? null : JSON.stringify(v).length > max ? { truncated: true } : v;
+	const evidence = capped(b.result_evidence, 200_000);
+	const params = capped(b.agent_params, 20_000);
 
 	const sql = getSql(env);
 	try {
@@ -79,8 +75,8 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 				 interpretation, result_count, result_empresa_ids, result_evidence, engine_version, response_ms, error)
 			values
 				(${source}, ${str(b.session_ref, 200)}, ${str(b.visitor_ref, 200)}, ${str(b.n8n_execution_id, 100)},
-				 ${userInput}, ${str(b.agent_tool, 50)}, ${params}::jsonb, ${str(b.interpretation, 50)}, ${ids.length},
-				 ${idsLiteral}::bigint[], ${evidence}::jsonb, ${str(b.engine_version, 200)}, ${responseMs}, ${str(b.error, 2000)})
+				 ${userInput}, ${str(b.agent_tool, 50)}, ${params == null ? null : sql.json(params as never)}, ${str(b.interpretation, 50)}, ${ids.length},
+				 ${idsLiteral}::bigint[], ${evidence == null ? null : sql.json(evidence as never)}, ${str(b.engine_version, 200)}, ${responseMs}, ${str(b.error, 2000)})
 			returning id
 		`;
 		return Response.json({ ok: true, id: Number(row.id) });
