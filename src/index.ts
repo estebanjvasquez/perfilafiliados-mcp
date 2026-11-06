@@ -25,6 +25,7 @@ import { registerTaxonomyTools } from './taxonomy-tools';
 import { registerEmpresaTools } from './empresa-tools';
 import { registerIntentTools } from './intent-tools';
 import { resolveDebugSearch } from './debug-search';
+import { handleSearchLog, handleSearchFeedback } from './search-feedback';
 
 export interface Env {
 	AI: Ai;
@@ -57,6 +58,14 @@ export default {
 
 		if (url.pathname === '/mcp') {
 			return handleMcp(request, env, ctx);
+		}
+
+		// TASK-0013: registro de búsquedas y votos de CIRA (Bearer MCP_TOKEN, solo n8n).
+		if (url.pathname === '/search-log' && request.method === 'POST') {
+			return handleSearchLog(request, env);
+		}
+		if (url.pathname === '/search-feedback' && request.method === 'POST') {
+			return handleSearchFeedback(request, env);
 		}
 
 		if (url.pathname === '/debug-search') {
