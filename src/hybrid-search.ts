@@ -111,10 +111,16 @@ export type EvidenceList =
 	| 'taxonomy'
 	| 'experiencia'
 	| 'canonical_cpv'
-	| 'canonical_related';
+	| 'canonical_related'
+	| 'sector_focus';
 
 export const LIST_WEIGHTS: Record<EvidenceList, number> = {
 	structured: 2.5,
+	// TASK-0013 paso 2: especialización en el sector/servicio LEGADO buscado (sector principal o
+	// secundario declarado, o mayoría de sus servicios en lo buscado). Decisión del propietario
+	// (2026-11-07): los sectores y servicios legados se conservan como dato de primera clase; la
+	// taxonomía CPV es información adicional, no su reemplazo.
+	sector_focus: 2.0,
 	name_typo: 2.0,
 	lexical_experiencia: 2.5,
 	lexical_taxonomy: 2.5,
@@ -146,6 +152,7 @@ export const MATCH_TYPE_BY_LIST: Record<EvidenceList, string> = {
 	experiencia: 'semantic',
 	canonical_cpv: 'canonical_direct',
 	canonical_related: 'canonical_related_candidate',
+	sector_focus: 'exact',
 };
 
 export type Evidence = {
@@ -172,6 +179,7 @@ export const DIRECT_EVIDENCE_LISTS: ReadonlySet<EvidenceList> = new Set([
 	'lexical_experiencia',
 	'lexical_taxonomy',
 	'fulltext',
+	'sector_focus',
 ]);
 
 export function isDirectEvidenceList(list: EvidenceList): boolean {
@@ -221,7 +229,76 @@ export async function embedPhrase(env: Env, phrase: string): Promise<string | nu
 // sociales libres que sí tiene `empresas.name`.
 export const NAME_SUBSTRING_MIN_LENGTH = 7;
 
-async function structuredList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
+/**
+ * TASK-0013 paso 2: empresas que coinciden con la frase en sus datos LEGADOS (servicios y sectores de
+ * `empresa_sector_service`, más `empresas.sector_principal_id`/`sector_secundario_id`), con su grado
+ * de especialización:
+ *  - tier 0: el sector principal declarado coincide; tier 1: el secundario; tier 2: ninguno de los dos;
+ *  - matched/total: cuántos de sus servicios coinciden (por nombre del servicio o de su sector).
+ * Antes el orden dentro de esta lista era arbitrario (`select distinct`), y una empresa con 1 de 25
+ * servicios en el sector quedaba igual o por encima de una dedicada a ese sector. El sector principal
+ * también cuenta como coincidencia aunque la empresa no tenga servicios cargados (ej. una operadora
+ * con sector principal OPERADORES y sin servicios no aparecía por esta vía).
+ */
+type LegacyRow = { empresa_id: number; tier: number; matched: number; total: number; principal: string | null; secundario: string | null };
+
+async function legacySectorServiceRows(sql: ReturnType<typeof getSql>, like: string): Promise<LegacyRow[]> {
+	return sql<LegacyRow[]>`
+		with svc as (
+			select ess.empresa_id,
+				count(distinct sv.id)::int as total,
+				count(distinct sv.id) filter (
+					where unaccent(sv.name) ilike unaccent(${like}) or unaccent(coalesce(s.name, '')) ilike unaccent(${like})
+				)::int as matched
+			from empresa_sector_service ess
+			join services sv on sv.id = ess.service_id
+			left join sectors s on s.id = sv.sectors_id
+			group by ess.empresa_id
+		)
+		select e.id as empresa_id,
+			case when unaccent(coalesce(sp.name, '')) ilike unaccent(${like}) then 0
+				when unaccent(coalesce(ss.name, '')) ilike unaccent(${like}) then 1
+				else 2 end as tier,
+			coalesce(svc.matched, 0) as matched,
+			coalesce(svc.total, 0) as total,
+			sp.name as principal,
+			ss.name as secundario
+		from empresas e
+		left join sectors sp on sp.id = e.sector_principal_id
+		left join sectors ss on ss.id = e.sector_secundario_id
+		left join svc on svc.empresa_id = e.id
+		where e.status_id = 1
+			and (coalesce(svc.matched, 0) > 0
+				or unaccent(coalesce(sp.name, '')) ilike unaccent(${like})
+				or unaccent(coalesce(ss.name, '')) ilike unaccent(${like}))
+		order by tier, (coalesce(svc.matched, 0)::float / nullif(svc.total, 0)) desc nulls last, svc.matched desc nulls last, e.id
+	`;
+}
+
+/** Mínimo de la proporción de servicios en lo buscado para considerar a la empresa especializada. */
+export const SECTOR_FOCUS_MIN_SHARE = 0.5;
+
+/**
+ * Lista `sector_focus`: solo las empresas especializadas en lo buscado (sector principal/secundario
+ * declarado, o al menos la mitad de sus servicios), en el mismo orden de `legacySectorServiceRows`.
+ * Es evidencia adicional sobre las que ya están en `structured`: nunca agrega empresas nuevas.
+ */
+function sectorFocusList(rows: LegacyRow[], phrase: string): Evidence[] {
+	const out: Evidence[] = [];
+	for (const r of rows) {
+		const total = Number(r.total);
+		const matched = Number(r.matched);
+		const share = total > 0 ? matched / total : 0;
+		let label: string | null = null;
+		if (Number(r.tier) === 0) label = `especializada en "${phrase}": sector principal ${String(r.principal).trim()}`;
+		else if (Number(r.tier) === 1) label = `especializada en "${phrase}": sector secundario ${String(r.secundario).trim()}`;
+		else if (share >= SECTOR_FOCUS_MIN_SHARE) label = `especializada en "${phrase}": ${matched} de ${total} servicios`;
+		if (label) out.push({ empresa_id: r.empresa_id, label });
+	}
+	return out;
+}
+
+async function structuredList(sql: ReturnType<typeof getSql>, phrase: string, legacy: LegacyRow[]): Promise<Evidence[]> {
 	const like = '%' + phrase + '%';
 	const nameRows =
 		phrase.length >= NAME_SUBSTRING_MIN_LENGTH
@@ -232,22 +309,7 @@ async function structuredList(sql: ReturnType<typeof getSql>, phrase: string): P
 			`
 			: [];
 
-	const serviceSectorRows = await sql<{ empresa_id: number }[]>`
-		select distinct e.id as empresa_id
-		from empresas e
-		where e.status_id = 1
-			and (
-				exists (
-					select 1 from empresa_sector_service ess join services sv on sv.id = ess.service_id
-					where ess.empresa_id = e.id and unaccent(sv.name) ilike unaccent(${like})
-				)
-				or exists (
-					select 1 from empresa_sector_service ess join services sv on sv.id = ess.service_id
-					join sectors s on s.id = sv.sectors_id
-					where ess.empresa_id = e.id and unaccent(s.name) ilike unaccent(${like})
-				)
-			)
-	`;
+	const serviceSectorRows = legacy.map((r) => ({ empresa_id: r.empresa_id }));
 
 	const normalized = phrase.toLowerCase().replace(/[^a-z0-9]/g, '');
 	const certColumns = ['iso9001', 'iso14001', 'iso45001', 'iso27001', 'iso50001', 'iso17025', 'iso37001', 'dun', 'ovid', 'pmi'];
@@ -485,6 +547,8 @@ export type PhraseEvidenceDetail = {
 	/** Fase 23B: `performance.now()` antes/después de cada señal - medir no cambia el orden de
 	 * ejecución (siguen corriendo en el mismo `Promise.all`), solo se envuelve cada promesa. */
 	timingsMs: Record<string, number>;
+	/** TASK-0013 paso 2: si el texto libre dejó de sumar empresas nuevas para esta frase (ver `applyTextOnlyGate`). */
+	textOnlyGate: TextOnlyGate;
 };
 
 /** Fase 23B: envuelve una promesa de señal para medir su duración sin alterar cuándo se resuelve ni su valor - el `Promise.all` de abajo sigue esperando exactamente las mismas promesas, en paralelo, en el mismo orden. */
@@ -500,8 +564,9 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 	const timingsMs: Record<string, number> = {};
 	const vector = await embedPhrase(env, phrase);
 
+	const legacyRows = legacySectorServiceRows(sql, '%' + phrase + '%');
 	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
-		timed(timingsMs, 'structured', structuredList(sql, phrase)),
+		timed(timingsMs, 'structured', legacyRows.then((legacy) => structuredList(sql, phrase, legacy))),
 		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase)),
 		timed(timingsMs, 'lexical_taxonomy', lexicalTaxonomyList(sql, phrase)),
 		timed(timingsMs, 'fulltext', fullTextList(sql, phrase)),
@@ -552,7 +617,10 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 		experiencia,
 		canonical_cpv: canonicalDirect,
 		canonical_related: canonicalRelated,
+		sector_focus: sectorFocusList(await legacyRows, phrase),
 	};
+
+	const textOnlyGate = applyTextOnlyGate(namedLists);
 
 	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
 	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
@@ -599,7 +667,50 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 		}
 	}
 
-	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs };
+	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs, textOnlyGate };
+}
+
+/**
+ * TASK-0013 paso 2: listas que solo encuentran la palabra en texto libre (perfil completo,
+ * experiencias). El full-text en español reduce a la misma raíz palabras distintas ("operadores",
+ * "operaciones", "operativo" -> "oper"), y las experiencias mencionan de todo ("Sala de Operadores"
+ * de una empresa de telecomunicaciones). Útiles cuando no hay otra evidencia (ej. "transporte de
+ * gandolas", que solo aparece en experiencias), ruido cuando la frase ya tiene coincidencias en el
+ * catálogo.
+ */
+export const TEXT_ONLY_LISTS: ReadonlySet<EvidenceList> = new Set(['fulltext', 'lexical_experiencia', 'experiencia']);
+
+/** Listas de catálogo: datos legados (nombre, sector, servicio, certificación, sostenibilidad) y taxonomía CPV. */
+export const CATALOG_LISTS: ReadonlySet<EvidenceList> = new Set(['structured', 'lexical_taxonomy', 'canonical_cpv']);
+
+/** Cuántas empresas con coincidencia de catálogo hacen falta para que el texto libre deje de sumar empresas nuevas. */
+export const TEXT_ONLY_GATE_MIN = 3;
+
+export type TextOnlyGate = { active: boolean; catalogCompanies: number; removed: Partial<Record<EvidenceList, number>> };
+
+/**
+ * Si la frase tiene al menos TEXT_ONLY_GATE_MIN empresas con coincidencia de catálogo, las listas de
+ * texto libre solo conservan empresas que alguna otra lista ya respalda: siguen sumando puntaje a
+ * esas, pero no agregan empresas nuevas. Modifica `namedLists` en el lugar, antes de la fusión, así
+ * el ranking, el corte de 20/150, el conteo de evidencia directa y la explicación ven lo mismo.
+ */
+export function applyTextOnlyGate(namedLists: Record<EvidenceList, Evidence[]>): TextOnlyGate {
+	const catalog = new Set<string>();
+	for (const list of CATALOG_LISTS) for (const r of namedLists[list]) catalog.add(String(r.empresa_id));
+	const gate: TextOnlyGate = { active: catalog.size >= TEXT_ONLY_GATE_MIN, catalogCompanies: catalog.size, removed: {} };
+	if (!gate.active) return gate;
+
+	const backed = new Set<string>();
+	for (const [list, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
+		if (TEXT_ONLY_LISTS.has(list)) continue;
+		for (const r of rows) backed.add(String(r.empresa_id));
+	}
+	for (const list of TEXT_ONLY_LISTS) {
+		const before = namedLists[list].length;
+		namedLists[list] = namedLists[list].filter((r) => backed.has(String(r.empresa_id)));
+		if (namedLists[list].length !== before) gate.removed[list] = before - namedLists[list].length;
+	}
+	return gate;
 }
 
 /**

@@ -62,6 +62,7 @@ const FUENTE: Record<EvidenceList, string> = {
 	taxonomy: 'Taxonomía CPV',
 	canonical_cpv: 'Taxonomía CPV (relación aprobada)',
 	canonical_related: 'Taxonomía CPV relacionada',
+	sector_focus: 'Especialización (sector o servicios)',
 };
 
 function kindOf(list: EvidenceList): ExplainKind {
@@ -105,7 +106,7 @@ async function structuredFields(sql: Sql, phrase: string, ids: string[]): Promis
 		out.set(id, arr);
 	};
 
-	const [names, services, sectors, certs, sust] = await Promise.all([
+	const [names, services, sectors, certs, sust, declared] = await Promise.all([
 		phrase.length >= NAME_SUBSTRING_MIN_LENGTH
 			? sql<{ id: number; name: string }[]>`select id, name from empresas where id in ${sql(ids)} and unaccent(name) ilike unaccent(${like})`
 			: Promise.resolve([] as { id: number; name: string }[]),
@@ -124,6 +125,14 @@ async function structuredFields(sql: Sql, phrase: string, ids: string[]): Promis
 			select distinct esa.empresa_id as id, sa.name
 			from empresa_sustainability_areas esa join sustainability_areas sa on sa.id = esa.area_id
 			where esa.empresa_id in ${sql(ids)} and (unaccent(sa.name) ilike unaccent(${like}) or unaccent(coalesce(sa.synonyms, '')) ilike unaccent(${like}))`,
+		sql<{ id: number; principal: string | null; secundario: string | null }[]>`
+			select e.id,
+				case when unaccent(coalesce(sp.name, '')) ilike unaccent(${like}) then sp.name end as principal,
+				case when unaccent(coalesce(ss.name, '')) ilike unaccent(${like}) then ss.name end as secundario
+			from empresas e
+			left join sectors sp on sp.id = e.sector_principal_id
+			left join sectors ss on ss.id = e.sector_secundario_id
+			where e.id in ${sql(ids)}`,
 	]);
 
 	for (const r of names) add(String(r.id), 'Nombre de la empresa', String(r.name).trim());
@@ -131,6 +140,34 @@ async function structuredFields(sql: Sql, phrase: string, ids: string[]): Promis
 	for (const r of sectors) add(String(r.id), 'Sector', String(r.name).trim());
 	for (const r of certs) add(String(r.id), 'Certificación', String(r.otras ?? '').trim().slice(0, 120));
 	for (const r of sust) add(String(r.id), 'Área de sostenibilidad', String(r.name).trim());
+	for (const r of declared) {
+		if (r.principal) add(String(r.id), 'Sector principal', String(r.principal).trim());
+		if (r.secundario) add(String(r.id), 'Sector secundario', String(r.secundario).trim());
+	}
+	return out;
+}
+
+/**
+ * Para la lista `fulltext`: qué palabras del perfil coincidieron de verdad y un fragmento. El
+ * full-text reduce las palabras a su raíz, así que "operadores" puede haber coincidido con
+ * "operaciones"; sin esto la explicación decía solo «coincide en texto con "operadores"».
+ * Misma normalización que el índice (`to_tsvector('spanish', unaccent(document))`).
+ */
+async function fulltextFragments(sql: Sql, phrase: string, ids: string[]): Promise<Map<string, { words: string[]; fragment: string }>> {
+	const out = new Map<string, { words: string[]; fragment: string }>();
+	if (ids.length === 0) return out;
+	const rows = await sql<{ id: number; frag: string }[]>`
+		select empresa_id as id,
+			ts_headline('spanish', unaccent(document), websearch_to_tsquery('spanish', unaccent(${phrase})),
+				'StartSel=«, StopSel=», MaxFragments=2, MaxWords=12, MinWords=4, FragmentDelimiter=" … "') as frag
+		from empresa_search_documents
+		where empresa_id in ${sql(ids)}
+	`;
+	for (const r of rows) {
+		const frag = String(r.frag ?? '').replace(/\s+/g, ' ').trim();
+		const words = Array.from(new Set(Array.from(frag.matchAll(/«([^»]+)»/g), (m) => m[1].toLowerCase())));
+		out.set(String(r.id), { words, fragment: frag.slice(0, 220) });
+	}
 	return out;
 }
 
@@ -154,6 +191,12 @@ export async function buildExplanations(
 		phraseDetails.map((d, i) => {
 			const ids = orderedIds.filter((id) => d.namedLists.structured.some((r) => String(r.empresa_id) === id));
 			return ids.length ? structuredFields(sql, phrases[i], ids) : Promise.resolve(new Map<string, { fuente: string; detalle: string }[]>());
+		})
+	);
+	const fulltextByPhrase = await Promise.all(
+		phraseDetails.map((d, i) => {
+			const ids = orderedIds.filter((id) => d.namedLists.fulltext.some((r) => String(r.empresa_id) === id));
+			return ids.length ? fulltextFragments(sql, phrases[i], ids) : Promise.resolve(new Map<string, { words: string[]; fragment: string }>());
 		})
 	);
 	const positions = phraseDetails.map(positionsByList);
@@ -182,7 +225,19 @@ export async function buildExplanations(
 					aporte_pct: score > 0 ? round((exacto / score) * 100, 1) : 0,
 				};
 				const fields = list === 'structured' ? structuredByPhrase[i].get(id) : undefined;
-				if (fields && fields.length) {
+				const ft = list === 'fulltext' ? fulltextByPhrase[i].get(id) : undefined;
+				if (ft && ft.words.length) {
+					const fold = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+					const phraseWords = new Set(fold(phrases[i]).split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+					const exact = ft.words.every((w) => phraseWords.has(fold(w)));
+					fuentes.push({
+						...base,
+						fuente: FUENTE[list],
+						detalle: exact
+							? `coincide en texto con "${phrases[i]}": ${ft.fragment}`
+							: `coincide en texto con "${phrases[i]}" por la palabra ${ft.words.map((w) => `«${w}»`).join(', ')} (misma raíz): ${ft.fragment}`,
+					});
+				} else if (fields && fields.length) {
 					fuentes.push({
 						...base,
 						fuente: Array.from(new Set(fields.map((f) => f.fuente))).join(' y '),
