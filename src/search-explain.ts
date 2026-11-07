@@ -229,13 +229,18 @@ export async function buildExplanations(
 				if (ft && ft.words.length) {
 					const fold = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
 					const phraseWords = new Set(fold(phrases[i]).split(/[^\p{L}\p{N}]+/u).filter(Boolean));
-					const exact = ft.words.every((w) => phraseWords.has(fold(w)));
+					const variants = ft.words.filter((w) => !phraseWords.has(fold(w)));
+					const hasExact = variants.length < ft.words.length;
+					const q = (ws: string[]) => ws.map((w) => `«${w}»`).join(', ');
 					fuentes.push({
 						...base,
 						fuente: FUENTE[list],
-						detalle: exact
-							? `coincide en texto con "${phrases[i]}": ${ft.fragment}`
-							: `coincide en texto con "${phrases[i]}" por la palabra ${ft.words.map((w) => `«${w}»`).join(', ')} (misma raíz): ${ft.fragment}`,
+						detalle:
+							variants.length === 0
+								? `coincide en texto con "${phrases[i]}": ${ft.fragment}`
+								: hasExact
+									? `coincide en texto con "${phrases[i]}" y también con ${q(variants)} (misma raíz): ${ft.fragment}`
+									: `coincide en texto con "${phrases[i]}" solo por ${q(variants)} (misma raíz, otra palabra): ${ft.fragment}`,
 					});
 				} else if (fields && fields.length) {
 					fuentes.push({

@@ -680,8 +680,13 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
  */
 export const TEXT_ONLY_LISTS: ReadonlySet<EvidenceList> = new Set(['fulltext', 'lexical_experiencia', 'experiencia']);
 
-/** Listas de catálogo: datos legados (nombre, sector, servicio, certificación, sostenibilidad) y taxonomía CPV. */
-export const CATALOG_LISTS: ReadonlySet<EvidenceList> = new Set(['structured', 'lexical_taxonomy', 'canonical_cpv']);
+/**
+ * Listas de catálogo con coincidencia DIRECTA: nombre, sector, servicio, certificación, sostenibilidad y el nombre
+ * literal de una categoría CPV. `canonical_cpv` no cuenta: es capacidad inferida (CPV_CAPABILITY en
+ * `classifyEvidence`), y con ella activando la compuerta «gandolas» perdía a la única empresa que la menciona
+ * literalmente en su experiencia (regresión congelada, 2026-11-07).
+ */
+export const CATALOG_LISTS: ReadonlySet<EvidenceList> = new Set(['structured', 'lexical_taxonomy']);
 
 /** Cuántas empresas con coincidencia de catálogo hacen falta para que el texto libre deje de sumar empresas nuevas. */
 export const TEXT_ONLY_GATE_MIN = 3;
