@@ -549,6 +549,8 @@ export type PhraseEvidenceDetail = {
 	timingsMs: Record<string, number>;
 	/** TASK-0013 paso 2: si el texto libre dejó de sumar empresas nuevas para esta frase (ver `applyTextOnlyGate`). */
 	textOnlyGate: TextOnlyGate;
+	/** TASK-0013 paso 3: empresas de una sola vía «similar a» quitadas para esta frase (ver `applySingleSimilarGate`). */
+	singleSimilarGate: SingleSimilarGate;
 };
 
 /** Fase 23B: envuelve una promesa de señal para medir su duración sin alterar cuándo se resuelve ni su valor - el `Promise.all` de abajo sigue esperando exactamente las mismas promesas, en paralelo, en el mismo orden. */
@@ -621,6 +623,7 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 	};
 
 	const textOnlyGate = applyTextOnlyGate(namedLists);
+	const singleSimilarGate = applySingleSimilarGate(namedLists);
 
 	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
 	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
@@ -667,7 +670,7 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 		}
 	}
 
-	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs, textOnlyGate };
+	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs, textOnlyGate, singleSimilarGate };
 }
 
 /**
@@ -715,6 +718,43 @@ export function applyTextOnlyGate(namedLists: Record<EvidenceList, Evidence[]>):
 		namedLists[list] = namedLists[list].filter((r) => backed.has(String(r.empresa_id)));
 		if (namedLists[list].length !== before) gate.removed[list] = before - namedLists[list].length;
 	}
+	return gate;
+}
+
+/**
+ * TASK-0013 paso 3: listas «similar a» (parecido de significado por embeddings): servicio, categoría CPV y
+ * experiencia parecidos. `canonical_related` no entra: es una relación de familia CPV curada, con su propia etiqueta.
+ */
+export const SIMILAR_LISTS: ReadonlySet<EvidenceList> = new Set(['service', 'taxonomy', 'experiencia']);
+
+export type SingleSimilarGate = { active: boolean; strongCompanies: number; removedCompanies: number };
+
+/**
+ * TASK-0013 paso 3: una empresa que solo aparece en UNA lista «similar a» (sin coincidencia literal, de catálogo ni
+ * otra vía) es la principal fuente de ruido señalada por el cliente (lote 001). Si la frase tiene al menos una
+ * empresa con respaldo más fuerte (otra lista, o «similar a» por dos o más vías), esas empresas de una sola vía se
+ * quitan. Si no hay ninguna más fuerte (ej. «camión chupón», solo en una experiencia), no se toca nada.
+ * Medido sobre las consultas juzgadas por el cliente: ruido top 5 44->31, top 10 49->34, sin perder relevantes.
+ */
+export function applySingleSimilarGate(namedLists: Record<EvidenceList, Evidence[]>): SingleSimilarGate {
+	const listsByCompany = new Map<string, Set<EvidenceList>>();
+	for (const [list, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
+		for (const r of rows) {
+			const id = String(r.empresa_id);
+			const set = listsByCompany.get(id) ?? new Set<EvidenceList>();
+			set.add(list);
+			listsByCompany.set(id, set);
+		}
+	}
+	const weak = new Set<string>();
+	for (const [id, lists] of listsByCompany) {
+		if (lists.size === 1 && SIMILAR_LISTS.has([...lists][0])) weak.add(id);
+	}
+	const strongCompanies = listsByCompany.size - weak.size;
+	const gate: SingleSimilarGate = { active: strongCompanies >= 1 && weak.size > 0, strongCompanies, removedCompanies: 0 };
+	if (!gate.active) return gate;
+	for (const list of SIMILAR_LISTS) namedLists[list] = namedLists[list].filter((r) => !weak.has(String(r.empresa_id)));
+	gate.removedCompanies = weak.size;
 	return gate;
 }
 
