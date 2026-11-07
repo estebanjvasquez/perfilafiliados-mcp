@@ -681,17 +681,6 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 export const TEXT_ONLY_LISTS: ReadonlySet<EvidenceList> = new Set(['fulltext', 'lexical_experiencia', 'experiencia']);
 
 /**
- * TASK-0013 paso 3: listas «similar a» (parecido de significado por embeddings) del catálogo: servicio parecido y
- * categoría CPV parecida. El cliente (lote 001) señaló que «similar a» casi nunca acierta, y en las consultas mal
- * evaluadas 22 de 41 empresas no relevantes del top 10 entraban por «similar a». Misma regla que el texto libre: con
- * coincidencias de catálogo suficientes, suman puntaje a empresas respaldadas pero no agregan empresas nuevas.
- */
-export const SEMANTIC_CATALOG_LISTS: ReadonlySet<EvidenceList> = new Set(['service', 'taxonomy']);
-
-/** Listas que filtra la compuerta: texto libre + «similar a» del catálogo. */
-export const GATED_LISTS: ReadonlySet<EvidenceList> = new Set([...TEXT_ONLY_LISTS, ...SEMANTIC_CATALOG_LISTS]);
-
-/**
  * Listas de catálogo con coincidencia DIRECTA: nombre, sector, servicio, certificación, sostenibilidad y el nombre
  * literal de una categoría CPV. `canonical_cpv` no cuenta: es capacidad inferida (CPV_CAPABILITY en
  * `classifyEvidence`), y con ella activando la compuerta «gandolas» perdía a la única empresa que la menciona
@@ -718,10 +707,10 @@ export function applyTextOnlyGate(namedLists: Record<EvidenceList, Evidence[]>):
 
 	const backed = new Set<string>();
 	for (const [list, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
-		if (GATED_LISTS.has(list)) continue;
+		if (TEXT_ONLY_LISTS.has(list)) continue;
 		for (const r of rows) backed.add(String(r.empresa_id));
 	}
-	for (const list of GATED_LISTS) {
+	for (const list of TEXT_ONLY_LISTS) {
 		const before = namedLists[list].length;
 		namedLists[list] = namedLists[list].filter((r) => backed.has(String(r.empresa_id)));
 		if (namedLists[list].length !== before) gate.removed[list] = before - namedLists[list].length;
