@@ -15,6 +15,7 @@ import {
 	LIST_WEIGHTS,
 	NAME_SUBSTRING_MIN_LENGTH,
 	RRF_K,
+	rankGroup,
 	TIER_NAME,
 	type EvidenceList,
 	type PhraseEvidenceDetail,
@@ -263,12 +264,12 @@ export async function buildExplanations(
 			}
 		});
 		// Lo declarado primero (mismo criterio que el orden de los resultados) y, dentro del nivel, mayor aporte.
-		fuentes.sort((a, b) => LIST_TIER[a.lista] - LIST_TIER[b.lista] || b.aporte - a.aporte);
+		fuentes.sort((a, b) => rankGroup(LIST_TIER[a.lista]) - rankGroup(LIST_TIER[b.lista]) || b.aporte - a.aporte);
 		out.set(id, {
 			posicion: idx + 1,
 			puntaje: round(score, 5),
 			puntaje_relativo: top > 0 ? Math.round((score / top) * 100) : 0,
-			nivel: TIER_NAME[fuentes.length ? LIST_TIER[fuentes[0].lista] : 3],
+			nivel: TIER_NAME[fuentes.length ? (Math.min(...fuentes.map((f) => LIST_TIER[f.lista])) as 1 | 2 | 3) : 3],
 			fuentes,
 			formula: `puntaje = suma de peso / (${RRF_K} + posición en cada fuente)`,
 		});

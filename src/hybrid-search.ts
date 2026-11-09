@@ -176,7 +176,7 @@ export type Evidence = {
  *       con posible error de tipeo;
  *   3 = coincidencia adicional: solo aparece en experiencias o en el texto del perfil.
  * El nivel de una empresa es el MEJOR (el número más bajo) de todas sus fuentes en todas las frases.
- * Dentro de cada nivel el puntaje sigue sumando todas las fuentes, así que una experiencia que
+ * Para ORDENAR solo se separa el nivel 1 del resto (ver `compareTierThenScore`). Dentro de cada bloque el puntaje sigue sumando todas las fuentes, así que una experiencia que
  * coincide ayuda a desempatar entre empresas del mismo nivel, pero nunca sube una empresa por
  * encima de otra que coincide en lo declarado.
  */
@@ -199,6 +199,11 @@ export const LIST_TIER: Record<EvidenceList, EvidenceTier> = {
 export const TIER_NAME: Record<EvidenceTier, 'declarado' | 'similar' | 'adicional'> = { 1: 'declarado', 2: 'similar', 3: 'adicional' };
 
 /** Evidencia fusionada de una empresa: puntaje RRF, mejor nivel y la etiqueta de la fuente que la representa. */
+/** Bloque de orden: 1 = declarado, 2 = todo lo demás (ver `compareTierThenScore`). */
+export function rankGroup(tier: EvidenceTier): 1 | 2 {
+	return tier === 1 ? 1 : 2;
+}
+
 export type FusedEvidence = {
 	score: number;
 	matchType: string;
@@ -210,7 +215,9 @@ export type FusedEvidence = {
 
 /** true si la fuente candidata (nivel, peso) debe reemplazar a la etiqueta actual. */
 function betterVia(tier: EvidenceTier, weight: number, current: { tier: EvidenceTier; viaWeight: number }): boolean {
-	return tier < current.tier || (tier === current.tier && weight > current.viaWeight);
+	const a = rankGroup(tier);
+	const b = rankGroup(current.tier);
+	return a < b || (a === b && weight > current.viaWeight);
 }
 
 // Fase 24 (corrección de causa raíz I): ÚNICA definición de qué cuenta como evidencia "directa"
@@ -928,7 +935,9 @@ export function mergePhraseEvidence(
 				merged.set(empresaId, { ...evidence });
 			} else {
 				// Etiqueta: la frase con mejor nivel; a igual nivel, la de mayor puntaje (como antes).
-				const replace = evidence.tier < existing.tier || (evidence.tier === existing.tier && evidence.score > existing.score);
+				const ga = rankGroup(evidence.tier);
+				const gb = rankGroup(existing.tier);
+				const replace = ga < gb || (ga === gb && evidence.score > existing.score);
 				merged.set(empresaId, {
 					score: existing.score + evidence.score,
 					matchType: replace ? evidence.matchType : existing.matchType,
@@ -942,9 +951,15 @@ export function mergePhraseEvidence(
 	return merged;
 }
 
-/** Orden final: primero el nivel (declarado, similar, adicional) y dentro de cada nivel el puntaje RRF. */
+/**
+ * Orden final: primero las empresas cuyo dato declarado coincide (nivel 1) y después todas las demás,
+ * cada bloque por puntaje RRF. «Similar» (2) y «adicional» (3) NO se separan entre sí para ordenar:
+ * medido con el lote 001 (G1-03 «revestidor»), forzar lo similar por encima subía servicios solo
+ * parecidos («revestimientos») sobre la empresa relevante que coincide literalmente en su experiencia
+ * («Integridad de Revestidores»). La distinción se mantiene en la explicación (`nivel`).
+ */
 export function compareTierThenScore(a: { tier: EvidenceTier; score: number }, b: { tier: EvidenceTier; score: number }): number {
-	return a.tier - b.tier || b.score - a.score;
+	return rankGroup(a.tier) - rankGroup(b.tier) || b.score - a.score;
 }
 
 export function rankedIds(evidence: Map<number, FusedEvidence>): FusedMatch[] {
