@@ -167,6 +167,52 @@ export type Evidence = {
 	relationType?: string | null;
 };
 
+/**
+ * TASK-0013 (pedido del propietario, 2026-11-09): el resultado se ordena primero por NIVEL de la
+ * coincidencia y después por el puntaje RRF, como un buscador web que muestra lo más relevante arriba.
+ *   1 = declarado: lo que la empresa declaró de sí misma (categoría CPV, sector, servicio; también su
+ *       nombre o certificación) coincide con lo buscado;
+ *   2 = similar a lo declarado: servicio o categoría CPV parecidos, relación de familia CPV o nombre
+ *       con posible error de tipeo;
+ *   3 = coincidencia adicional: solo aparece en experiencias o en el texto del perfil.
+ * El nivel de una empresa es el MEJOR (el número más bajo) de todas sus fuentes en todas las frases.
+ * Dentro de cada nivel el puntaje sigue sumando todas las fuentes, así que una experiencia que
+ * coincide ayuda a desempatar entre empresas del mismo nivel, pero nunca sube una empresa por
+ * encima de otra que coincide en lo declarado.
+ */
+export type EvidenceTier = 1 | 2 | 3;
+
+export const LIST_TIER: Record<EvidenceList, EvidenceTier> = {
+	structured: 1,
+	sector_focus: 1,
+	lexical_taxonomy: 1,
+	canonical_cpv: 1,
+	service: 2,
+	taxonomy: 2,
+	canonical_related: 2,
+	name_typo: 2,
+	lexical_experiencia: 3,
+	fulltext: 3,
+	experiencia: 3,
+};
+
+export const TIER_NAME: Record<EvidenceTier, 'declarado' | 'similar' | 'adicional'> = { 1: 'declarado', 2: 'similar', 3: 'adicional' };
+
+/** Evidencia fusionada de una empresa: puntaje RRF, mejor nivel y la etiqueta de la fuente que la representa. */
+export type FusedEvidence = {
+	score: number;
+	matchType: string;
+	matchedVia: string;
+	tier: EvidenceTier;
+	/** Peso de la lista que dio `matchedVia` (para elegir la etiqueta: mejor nivel, después mayor peso). */
+	viaWeight: number;
+};
+
+/** true si la fuente candidata (nivel, peso) debe reemplazar a la etiqueta actual. */
+function betterVia(tier: EvidenceTier, weight: number, current: { tier: EvidenceTier; viaWeight: number }): boolean {
+	return tier < current.tier || (tier === current.tier && weight > current.viaWeight);
+}
+
 // Fase 24 (corrección de causa raíz I): ÚNICA definición de qué cuenta como evidencia "directa"
 // (coincidencia literal/estructurada, no inferida por taxonomía/semántica) - antes convivían dos
 // definiciones divergentes (`countDirectMatches` solo miraba `structuredList`; `debug-search.ts`
@@ -206,7 +252,7 @@ export function classifyEvidence(sources: EvidenceList[]): { isDirect: boolean; 
 	return { isDirect: false, strength: 'RELATED_CAPABILITY' };
 }
 
-export type FusedMatch = { empresa_id: number; score: number; matchType: string; matchedVia: string };
+export type FusedMatch = { empresa_id: number; score: number; matchType: string; matchedVia: string; tier: EvidenceTier };
 
 /** Un embedding por frase (bge-m3, mismo modelo que ya usan taxonomía/servicios/experiencias). */
 export async function embedPhrase(env: Env, phrase: string): Promise<string | null> {
@@ -538,7 +584,7 @@ function truncate(text: string, max = 100): string {
 export type PhraseEvidenceDetail = {
 	namedLists: Record<EvidenceList, Evidence[]>;
 	canonicalCtx: CanonicalSearchContext;
-	result: Map<number, { score: number; matchType: string; matchedVia: string }>;
+	result: Map<number, FusedEvidence>;
 	/** Fase 23B: contribución RRF que CADA señal aportó a CADA empresa - ya se calculaba al vuelo
 	 * dentro del loop de fusión de abajo, solo faltaba guardarla desagregada en vez de colapsarla
 	 * directo al score final. Usado por `/debug-search` para el desglose por empresa (nunca por el
@@ -625,7 +671,7 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 	const textOnlyGate = applyTextOnlyGate(namedLists);
 	const singleSimilarGate = applySingleSimilarGate(namedLists);
 
-	const result = new Map<number, { score: number; matchType: string; matchedVia: string }>();
+	const result = new Map<number, FusedEvidence>();
 	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
 	// Fase 24, Fase 2 (evidence layering, punto 9 del pedido): multiplicador GENERAL adicional sobre
 	// el peso de `canonical_related` en la fusión RRF - independiente de `level5_fallback_penalty`
@@ -654,17 +700,23 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 			perEmpresaContributions.set(row.empresa_id, contributions);
 
 			const existing = result.get(row.empresa_id);
+			const tier = LIST_TIER[listName];
 			if (!existing) {
-				result.set(row.empresa_id, { score: contribution, matchType: MATCH_TYPE_BY_LIST[listName], matchedVia: row.label });
+				result.set(row.empresa_id, { score: contribution, matchType: MATCH_TYPE_BY_LIST[listName], matchedVia: row.label, tier, viaWeight: weight });
 			} else {
-				// La etiqueta explicativa se queda con la de mayor peso ya vista (primera lista con
-				// peso mas alto que aporto a esta empresa) - RRF suma el score de TODAS las listas,
-				// pero mostrar todas las razones a la vez satura `matched_via` sin agregar valor real.
-				const existingWeight = LIST_WEIGHTS[Object.entries(MATCH_TYPE_BY_LIST).find(([, mt]) => mt === existing.matchType)?.[0] as EvidenceList] ?? 0;
+				// La etiqueta explicativa es la de la fuente de MEJOR nivel (lo declarado antes que la
+				// experiencia o el texto) y, a igual nivel, la de mayor peso - RRF suma el score de TODAS
+				// las listas, pero mostrar todas las razones a la vez satura `matched_via`.
+				// TASK-0013 (2026-11-09): antes elegía solo por peso y, en empate, la primera lista
+				// recorrida; con «balancin», Lukiven mostraba la experiencia aunque también coincidía
+				// por su categoría CPV (mismo peso 2.5).
+				const replace = betterVia(tier, weight, existing);
 				result.set(row.empresa_id, {
 					score: existing.score + contribution,
-					matchType: weight > existingWeight ? MATCH_TYPE_BY_LIST[listName] : existing.matchType,
-					matchedVia: weight > existingWeight ? row.label : existing.matchedVia,
+					matchType: replace ? MATCH_TYPE_BY_LIST[listName] : existing.matchType,
+					matchedVia: replace ? row.label : existing.matchedVia,
+					tier: Math.min(existing.tier, tier) as EvidenceTier,
+					viaWeight: replace ? weight : existing.viaWeight,
 				});
 			}
 		}
@@ -768,7 +820,7 @@ export async function resolvePhraseEvidence(
 	sql: ReturnType<typeof getSql>,
 	env: Env,
 	phrase: string
-): Promise<Map<number, { score: number; matchType: string; matchedVia: string }>> {
+): Promise<Map<number, FusedEvidence>> {
 	return (await computePhraseEvidence(sql, env, phrase)).result;
 }
 
@@ -864,21 +916,25 @@ export function countDirectCompanies(namedLists: Record<EvidenceList, Evidence[]
 
 /** Fusiona los mapas de score de varias frases (multi_concept) sumando contribuciones - mismo principio RRF, cada frase es una fuente de evidencia mas. */
 export function mergePhraseEvidence(
-	maps: Map<number, { score: number; matchType: string; matchedVia: string }>[]
-): Map<number, { score: number; matchType: string; matchedVia: string }> {
+	maps: Map<number, FusedEvidence>[]
+): Map<number, FusedEvidence> {
 	if (maps.length === 1) return maps[0];
 
-	const merged = new Map<number, { score: number; matchType: string; matchedVia: string }>();
+	const merged = new Map<number, FusedEvidence>();
 	for (const map of maps) {
 		for (const [empresaId, evidence] of map) {
 			const existing = merged.get(empresaId);
 			if (!existing) {
 				merged.set(empresaId, { ...evidence });
 			} else {
+				// Etiqueta: la frase con mejor nivel; a igual nivel, la de mayor puntaje (como antes).
+				const replace = evidence.tier < existing.tier || (evidence.tier === existing.tier && evidence.score > existing.score);
 				merged.set(empresaId, {
 					score: existing.score + evidence.score,
-					matchType: evidence.score > existing.score ? evidence.matchType : existing.matchType,
-					matchedVia: evidence.score > existing.score ? evidence.matchedVia : existing.matchedVia,
+					matchType: replace ? evidence.matchType : existing.matchType,
+					matchedVia: replace ? evidence.matchedVia : existing.matchedVia,
+					tier: Math.min(existing.tier, evidence.tier) as EvidenceTier,
+					viaWeight: replace ? evidence.viaWeight : existing.viaWeight,
 				});
 			}
 		}
@@ -886,8 +942,13 @@ export function mergePhraseEvidence(
 	return merged;
 }
 
-export function rankedIds(evidence: Map<number, { score: number; matchType: string; matchedVia: string }>): FusedMatch[] {
+/** Orden final: primero el nivel (declarado, similar, adicional) y dentro de cada nivel el puntaje RRF. */
+export function compareTierThenScore(a: { tier: EvidenceTier; score: number }, b: { tier: EvidenceTier; score: number }): number {
+	return a.tier - b.tier || b.score - a.score;
+}
+
+export function rankedIds(evidence: Map<number, FusedEvidence>): FusedMatch[] {
 	return Array.from(evidence.entries())
-		.map(([empresa_id, e]) => ({ empresa_id, score: e.score, matchType: e.matchType, matchedVia: e.matchedVia }))
-		.sort((a, b) => b.score - a.score);
+		.map(([empresa_id, e]) => ({ empresa_id, score: e.score, matchType: e.matchType, matchedVia: e.matchedVia, tier: e.tier }))
+		.sort(compareTierThenScore);
 }

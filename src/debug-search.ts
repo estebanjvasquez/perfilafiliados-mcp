@@ -10,8 +10,10 @@ import {
 	isDirectEvidenceList,
 	LIST_WEIGHTS,
 	MATCH_TYPE_BY_LIST,
+	TIER_NAME,
 	type EvidenceList,
 	type Evidence,
+	type FusedMatch,
 	type PhraseEvidenceDetail,
 } from './hybrid-search';
 
@@ -59,7 +61,7 @@ function buildReportShape(input: {
 	resolvedPhrases: string[];
 	phraseDetails: { phrase: string; detail: PhraseEvidenceDetail }[];
 	empresasById: Map<number, EmpresaRow>;
-	ranked: { empresa_id: number; score: number; matchType: string; matchedVia: string }[];
+	ranked: FusedMatch[];
 	directCompanyCount: number;
 	crawlerSystemWideTotal: number;
 	totalMs: number;
@@ -189,7 +191,7 @@ function levelToNumber(level: string): number {
 }
 
 function buildCandidateDetail(
-	ranked: { empresa_id: number; score: number; matchType: string; matchedVia: string },
+	ranked: FusedMatch,
 	index: number,
 	phraseDetails: { phrase: string; detail: PhraseEvidenceDetail }[],
 	empresasById: Map<number, EmpresaRow>
@@ -242,6 +244,7 @@ function buildCandidateDetail(
 		empresa_name: empresa?.name ?? `#${ranked.empresa_id}`,
 		match_type: ranked.matchType,
 		matched_via: ranked.matchedVia,
+		match_level: TIER_NAME[ranked.tier],
 		score: Math.round(ranked.score * 10000) / 10000,
 		evidence_sources: Array.from(new Set(evidenceBySource.map((e) => e.source))),
 		score_breakdown: scoreBreakdown,

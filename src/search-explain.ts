@@ -11,9 +11,11 @@
 import type { getSql } from './db';
 import {
 	isDirectEvidenceList,
+	LIST_TIER,
 	LIST_WEIGHTS,
 	NAME_SUBSTRING_MIN_LENGTH,
 	RRF_K,
+	TIER_NAME,
 	type EvidenceList,
 	type PhraseEvidenceDetail,
 } from './hybrid-search';
@@ -21,6 +23,9 @@ import {
 type Sql = ReturnType<typeof getSql>;
 
 export type ExplainKind = 'coincide' | 'capacidad_cpv' | 'similar' | 'relacionado';
+
+/** TASK-0013 (2026-11-09): declarado | similar | adicional (ver LIST_TIER en hybrid-search.ts). */
+export type ExplainLevel = (typeof TIER_NAME)[keyof typeof TIER_NAME];
 
 export type ExplainSource = {
 	/** Fuente legible: "Servicio", "Sector", "Experiencia", "Taxonomía CPV"... */
@@ -40,6 +45,7 @@ export type ExplainSource = {
 	aporte: number;
 	/** Porcentaje del puntaje de la empresa que viene de esta fuente. */
 	aporte_pct: number;
+	nivel: ExplainLevel;
 };
 
 export type Explain = {
@@ -47,6 +53,8 @@ export type Explain = {
 	puntaje: number;
 	/** Puntaje relativo al primer resultado de la lista (= 100). */
 	puntaje_relativo: number;
+	/** Mejor nivel entre sus fuentes: los resultados se ordenan primero por este nivel y después por el puntaje. */
+	nivel: ExplainLevel;
 	fuentes: ExplainSource[];
 	formula: string;
 };
@@ -223,6 +231,7 @@ export async function buildExplanations(
 					posicion_en_fuente: p.pos,
 					aporte: round(exacto, 5),
 					aporte_pct: score > 0 ? round((exacto / score) * 100, 1) : 0,
+					nivel: TIER_NAME[LIST_TIER[list]],
 				};
 				const fields = list === 'structured' ? structuredByPhrase[i].get(id) : undefined;
 				const ft = list === 'fulltext' ? fulltextByPhrase[i].get(id) : undefined;
@@ -253,11 +262,13 @@ export async function buildExplanations(
 				}
 			}
 		});
-		fuentes.sort((a, b) => b.aporte - a.aporte);
+		// Lo declarado primero (mismo criterio que el orden de los resultados) y, dentro del nivel, mayor aporte.
+		fuentes.sort((a, b) => LIST_TIER[a.lista] - LIST_TIER[b.lista] || b.aporte - a.aporte);
 		out.set(id, {
 			posicion: idx + 1,
 			puntaje: round(score, 5),
 			puntaje_relativo: top > 0 ? Math.round((score / top) * 100) : 0,
+			nivel: TIER_NAME[fuentes.length ? LIST_TIER[fuentes[0].lista] : 3],
 			fuentes,
 			formula: `puntaje = suma de peso / (${RRF_K} + posición en cada fuente)`,
 		});

@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Env } from './index';
 import { getSql } from './db';
-import { computePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectCompanies, debugCanonicalSearch } from './hybrid-search';
+import { computePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectCompanies, debugCanonicalSearch, compareTierThenScore, TIER_NAME } from './hybrid-search';
 import { buildExplanations } from './search-explain';
 
 /**
@@ -512,11 +512,18 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					.map((r) => {
 						const evidence = evidenceByEmpresaId.get(r.id);
 						return {
-							row: { ...r, match_type: evidence?.matchType ?? 'exact', matched_via: evidence?.matchedVia ?? '' },
+							row: {
+								...r,
+								match_type: evidence?.matchType ?? 'exact',
+								matched_via: evidence?.matchedVia ?? '',
+								// TASK-0013 (2026-11-09): declarado | similar | adicional - ver LIST_TIER.
+								match_level: TIER_NAME[evidence?.tier ?? 3],
+							},
 							score: evidence?.score ?? 0,
+							tier: evidence?.tier ?? 3,
 						};
 					})
-					.sort((a, b) => b.score - a.score)
+					.sort(compareTierThenScore)
 					.slice(0, effectiveLimit);
 
 				if (!explain) {
