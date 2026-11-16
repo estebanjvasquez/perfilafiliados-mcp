@@ -585,16 +585,18 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 			description:
 				'Devuelve la ficha completa de UNA empresa afiliada, por RIF exacto o por nombre (parcial). ' +
 				'Requiere al menos uno de los dos parámetros. Si el nombre es ambiguo puede devolver varias ' +
-				'coincidencias - en ese caso hay que pedirle al usuario que precise cuál.',
+				'coincidencias - en ese caso hay que pedirle al usuario que precise cuál. ' +
+				'Con "id" (id interno estable, el que trae una tarjeta de resultados) devuelve esa empresa y tiene prioridad.',
 			inputSchema: {
+				id: z.number().int().positive().optional().describe('Id interno de la empresa (el de una tarjeta de resultados). Tiene prioridad'),
 				rif: z.string().optional().describe('RIF exacto, ej. J070093501 (con o sin guiones/espacios/letra minúscula)'),
 				nombre: z.string().optional().describe('Nombre o parte distintiva del nombre de la empresa'),
 			},
 		},
-		async ({ rif, nombre }) => {
-			if (!rif && !nombre) {
+		async ({ id, rif, nombre }) => {
+			if (!id && !rif && !nombre) {
 				return {
-					content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Debe indicar rif o nombre.' }) }],
+					content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Debe indicar id, rif o nombre.' }) }],
 				};
 			}
 
@@ -605,7 +607,16 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 				// guiones/espacios/simbolos - para que "j-07-040984-3"/"J070409843" matcheen igual.
 				const normalizedRif = rif ? rif.toUpperCase().replace(/[^A-Z0-9]/g, '') : null;
 
-				let rows = normalizedRif
+				// TASK-0032: el id de una tarjeta identifica la empresa sin depender de cómo el agente reescriba
+				// el nombre. Mismo criterio de pertenencia al Perfil de Afiliados que el resto (status_id = 1);
+				// `chamber_empresa` (afiliaciones a OTRAS cámaras) no interviene.
+				let rows = id
+					? await sql`
+						${empresaSelectAndJoins(sql)}
+						where e.status_id = 1 and e.id = ${id}
+						limit 1
+					`
+					: normalizedRif
 					? await sql`
 						${empresaSelectAndJoins(sql)}
 						where e.status_id = 1 and e.rif = ${normalizedRif}
@@ -620,10 +631,24 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 
 				// Mismo fallback de tolerancia a errores de tipeo que search_empresas (ver docblock de
 				// arriba) - solo aplica a busqueda por nombre, un RIF exacto no tiene "aproximado".
-				if (rows.length === 0 && nombre) {
+				if (rows.length === 0 && nombre && !id) {
 					rows = await sql`
 						${empresaSelectAndJoins(sql)}
 						where e.status_id = 1 and word_similarity(unaccent(${nombre}), unaccent(e.name)) > 0.5
+						order by e.name
+						limit 5
+					`;
+				}
+
+				// TASK-0032: siglas con o sin puntos ("ioed" frente a "I.O.E.D COMPANY"). Solo si lo anterior no
+				// encontró nada: se comparan nombre y término sin signos de puntuación, conservando los espacios
+				// para no unir palabras distintas. Lo que ya encontraba algo no cambia.
+				const bare = nombre ? nombre.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim() : '';
+				if (rows.length === 0 && nombre && !id && bare.length >= 3) {
+					rows = await sql`
+						${empresaSelectAndJoins(sql)}
+						where e.status_id = 1
+							and regexp_replace(regexp_replace(lower(unaccent(e.name)), '[^a-z0-9 ]', '', 'g'), '\\s+', ' ', 'g') like ${'%' + bare + '%'}
 						order by e.name
 						limit 5
 					`;
