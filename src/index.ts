@@ -38,6 +38,9 @@ export interface Env {
 	// NO se embebe en esa página (sin login) - la página guarda esta clave en sessionStorage cuando
 	// el admin escribe "/debug-on <clave>", nunca en el código fuente servido (ver plan de Fase 23B).
 	DEBUG_TOKEN: string;
+	// TASK-0029: versión desplegada del Worker (binding `version_metadata` de wrangler.toml), para registrar en
+	// `cira_search_log.engine_version` qué versión respondió cada búsqueda.
+	CF_VERSION_METADATA?: { id: string; tag?: string; timestamp?: string };
 }
 
 interface EmbedRequestBody {

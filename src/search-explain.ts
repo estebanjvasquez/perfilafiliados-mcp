@@ -184,16 +184,29 @@ async function fulltextFragments(sql: Sql, phrase: string, ids: string[]): Promi
  * Explicación para cada empresa de `orderedIds` (en el orden mostrado). `phraseDetails[i]` corresponde
  * a `phrases[i]`. `scores` es el puntaje fusionado con el que se ordenó.
  */
+export type ExplainOptions = {
+	/** TASK-0029: rótulo de fuente por lista (p. ej. el texto del perfil del grupo de capacidades frente al de experiencias). */
+	fuente?: Partial<Record<EvidenceList, string>>;
+	/**
+	 * TASK-0029: false = no mostrar el fragmento del documento de texto completo. En el grupo de capacidades el
+	 * fragmento saldría del documento mezclado y podría ser una experiencia, aunque la coincidencia que cuenta sea otra.
+	 */
+	fulltextFragments?: boolean;
+};
+
 export async function buildExplanations(
 	sql: Sql,
 	phrases: string[],
 	phraseDetails: PhraseEvidenceDetail[],
 	orderedIds: string[],
-	scores: Map<string, number>
+	scores: Map<string, number>,
+	options: ExplainOptions = {}
 ): Promise<Map<string, Explain>> {
 	const out = new Map<string, Explain>();
 	if (orderedIds.length === 0) return out;
 	const top = scores.get(orderedIds[0]) ?? 0;
+	const fuenteOf = (list: EvidenceList) => options.fuente?.[list] ?? FUENTE[list];
+	const withFragments = options.fulltextFragments !== false;
 
 	// Detalle de campo para la lista structured, una consulta por frase y solo si hace falta.
 	const structuredByPhrase = await Promise.all(
@@ -204,7 +217,7 @@ export async function buildExplanations(
 	);
 	const fulltextByPhrase = await Promise.all(
 		phraseDetails.map((d, i) => {
-			const ids = orderedIds.filter((id) => d.namedLists.fulltext.some((r) => String(r.empresa_id) === id));
+			const ids = withFragments ? orderedIds.filter((id) => d.namedLists.fulltext.some((r) => String(r.empresa_id) === id)) : [];
 			return ids.length ? fulltextFragments(sql, phrases[i], ids) : Promise.resolve(new Map<string, { words: string[]; fragment: string }>());
 		})
 	);
@@ -244,7 +257,7 @@ export async function buildExplanations(
 					const q = (ws: string[]) => ws.map((w) => `«${w}»`).join(', ');
 					fuentes.push({
 						...base,
-						fuente: FUENTE[list],
+						fuente: fuenteOf(list),
 						detalle:
 							variants.length === 0
 								? `coincide en texto con "${phrases[i]}": ${ft.fragment}`
@@ -259,7 +272,7 @@ export async function buildExplanations(
 						detalle: `coincide con "${phrases[i]}": ` + fields.map((f) => `${f.fuente.toLowerCase()} ${f.detalle}`).join('; '),
 					});
 				} else {
-					fuentes.push({ ...base, fuente: FUENTE[list], detalle: p.label });
+					fuentes.push({ ...base, fuente: fuenteOf(list), detalle: p.label });
 				}
 			}
 		});

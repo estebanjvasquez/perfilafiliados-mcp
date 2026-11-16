@@ -13,3 +13,7 @@ binding = "AI"
 [[hyperdrive]]
 binding = "HYPERDRIVE"
 id = "f16a1ab0a9514504b80bd14138699d4c"
+
+# TASK-0029: version desplegada (id) disponible en env.CF_VERSION_METADATA, para registrarla en cira_search_log.
+[version_metadata]
+binding = "CF_VERSION_METADATA"

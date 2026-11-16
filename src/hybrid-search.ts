@@ -165,6 +165,28 @@ export type Evidence = {
 	// - esas no existen todavía) - se expone tal cual la guarda el Auto Mapper, sin adivinar semántica
 	// que esos ~9.700 mappings nunca tuvieron.
 	relationType?: string | null;
+	/** TASK-0029: experiencia que originó la evidencia (listas de experiencias), para mostrarla aparte de las capacidades. */
+	experienciaId?: number;
+	/** TASK-0029: fragmento de la experiencia (texto real, truncado). */
+	fragmento?: string;
+};
+
+/**
+ * TASK-0029 (alternativa B de la auditoría TASK-0028): modo opcional de dos grupos. Sin `grupos`, el cálculo es
+ * exactamente el de siempre; con `grupos`, cada frase devuelve además la evidencia separada en capacidades
+ * (catálogo: nombre, servicio, sector, categoría CPV, certificación, sostenibilidad y el texto del perfil que NO
+ * viene de experiencias) y experiencias (literal, por significado y el texto del perfil que solo coincide en
+ * experiencias), cada una fusionada por su lado, sin mezclar puntajes.
+ */
+export type PhraseOptions = { grupos?: boolean };
+
+/** Listas que solo describen experiencias (proyectos ejecutados). */
+export const EXPERIENCE_LISTS: ReadonlySet<EvidenceList> = new Set(['lexical_experiencia', 'experiencia']);
+
+export type GroupEvidence = {
+	namedLists: Record<EvidenceList, Evidence[]>;
+	result: Map<number, FusedEvidence>;
+	perEmpresaContributions: Map<number, Partial<Record<EvidenceList, number>>>;
 };
 
 /**
@@ -397,13 +419,27 @@ async function nameTypoList(sql: ReturnType<typeof getSql>, phrase: string): Pro
 	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `similar a "${phrase}" (nombre de empresa, posible diferencia de tipeo)` }));
 }
 
-async function lexicalExperienciaList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
-	const rows = await sql<{ empresa_id: number; descripcion: string }[]>`
-		select empresa_id, descripcion from empresa_experiencias
-		where unaccent(descripcion) ilike unaccent(${'%' + phrase + '%'})
-		limit 20
-	`;
-	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `coincide con "${phrase}" (experiencia: ${truncate(r.descripcion)})` }));
+async function lexicalExperienciaList(sql: ReturnType<typeof getSql>, phrase: string, ordered = false): Promise<Evidence[]> {
+	// TASK-0029: en el modo de dos grupos el orden es determinista (`order by id`, el orden de carga). Sin él,
+	// Postgres devuelve las 20 primeras filas que encuentra, que pueden cambiar entre ejecuciones (TASK-0028 §7).
+	const rows = ordered
+		? await sql<{ id: number; empresa_id: number; descripcion: string }[]>`
+			select id, empresa_id, descripcion from empresa_experiencias
+			where unaccent(descripcion) ilike unaccent(${'%' + phrase + '%'})
+			order by id
+			limit 20
+		`
+		: await sql<{ id: number; empresa_id: number; descripcion: string }[]>`
+			select empresa_id, descripcion from empresa_experiencias
+			where unaccent(descripcion) ilike unaccent(${'%' + phrase + '%'})
+			limit 20
+		`;
+	return rows.map((r) => ({
+		empresa_id: r.empresa_id,
+		label: `coincide con "${phrase}" (experiencia: ${truncate(r.descripcion)})`,
+		...(r.id != null ? { experienciaId: Number(r.id) } : {}),
+		fragmento: snippet(r.descripcion, phrase),
+	}));
 }
 
 async function lexicalTaxonomyList(sql: ReturnType<typeof getSql>, phrase: string): Promise<Evidence[]> {
@@ -564,9 +600,9 @@ async function vectorTaxonomyList(sql: ReturnType<typeof getSql>, vector: string
 }
 
 async function vectorExperienciaList(sql: ReturnType<typeof getSql>, vector: string, phrase: string): Promise<Evidence[]> {
-	const rows = await sql<{ empresa_id: number; descripcion: string }[]>`
-		select empresa_id, descripcion from (
-			select distinct on (ee.empresa_id) ee.empresa_id, ee.descripcion, (eee.embedding <=> ${vector}::vector) as score
+	const rows = await sql<{ empresa_id: number; descripcion: string; id: number }[]>`
+		select empresa_id, descripcion, id from (
+			select distinct on (ee.empresa_id) ee.empresa_id, ee.descripcion, ee.id, (eee.embedding <=> ${vector}::vector) as score
 			from empresa_experiencia_embeddings eee
 			join empresa_experiencias ee on ee.id = eee.experiencia_id
 			where (eee.embedding <=> ${vector}::vector) < ${EXPERIENCIA_THRESHOLD}
@@ -575,11 +611,66 @@ async function vectorExperienciaList(sql: ReturnType<typeof getSql>, vector: str
 		order by score asc
 		limit ${EXPERIENCIA_VECTOR_LIMIT}
 	`;
-	return rows.map((r) => ({ empresa_id: r.empresa_id, label: `similar a "${phrase}" (experiencia: ${truncate(r.descripcion)})` }));
+	return rows.map((r) => ({
+		empresa_id: r.empresa_id,
+		label: `similar a "${phrase}" (experiencia: ${truncate(r.descripcion)})`,
+		experienciaId: Number(r.id),
+		fragmento: snippet(r.descripcion, null),
+	}));
+}
+
+/**
+ * TASK-0029: de las empresas que encontró `fullTextList`, cuáles coinciden también SIN el texto de sus
+ * experiencias. El documento de `empresa_search_documents` mezcla catálogo y experiencias (64 % del texto,
+ * TASK-0028 §2); se quita cada experiencia del documento (la más larga primero, igual que `esd_noexp` de la
+ * auditoría) y se vuelve a probar la misma consulta de texto. Una sola consulta, solo sobre esas empresas: no
+ * regenera ni escribe nada. Las que no coinciden sin experiencias son evidencia de experiencia, no de capacidad.
+ */
+async function fulltextCatalogIds(sql: ReturnType<typeof getSql>, phrase: string, ids: number[]): Promise<Set<number>> {
+	if (ids.length === 0) return new Set();
+	const rows = await sql<{ empresa_id: number }[]>`
+		with recursive exps as (
+			select ee.empresa_id, ee.descripcion,
+				row_number() over (partition by ee.empresa_id order by length(ee.descripcion) desc, ee.id) as rn
+			from empresa_experiencias ee
+			where ee.empresa_id in ${sql(ids)} and coalesce(ee.descripcion, '') <> ''
+		),
+		strip(empresa_id, doc, rn) as (
+			select esd.empresa_id, esd.document, 0 from empresa_search_documents esd where esd.empresa_id in ${sql(ids)}
+			union all
+			select s.empresa_id, replace(s.doc, e.descripcion, ' '), s.rn + 1
+			from strip s join exps e on e.empresa_id = s.empresa_id and e.rn = s.rn + 1
+		),
+		final as (select distinct on (empresa_id) empresa_id, doc from strip order by empresa_id, rn desc)
+		select f.empresa_id
+		from final f, websearch_to_tsquery('spanish', unaccent(${phrase})) q
+		where to_tsvector('spanish', unaccent(f.doc)) @@ q
+	`;
+	return new Set(rows.map((r) => Number(r.empresa_id)));
 }
 
 function truncate(text: string, max = 100): string {
 	return text.length > max ? text.slice(0, max).trimEnd() + '…' : text;
+}
+
+/**
+ * TASK-0029: fragmento de una experiencia en una sola línea y, si la frase aparece (sin distinguir tildes ni
+ * mayúsculas), centrado en ella, para que el usuario vea por qué coincidió.
+ */
+export function snippet(text: string, phrase: string | null, max = 220): string {
+	const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+	if (!phrase || flat.length <= max) return truncate(flat, max);
+	const foldChar = (ch: string) => {
+		const f = ch.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+		return f.length === 1 ? f : ch.toLowerCase().slice(0, 1) || ' ';
+	};
+	const folded = Array.from(flat, foldChar).join('');
+	const needle = Array.from(phrase.replace(/\s+/g, ' ').trim(), foldChar).join('');
+	const at = needle ? folded.indexOf(needle) : -1;
+	if (at < 0 || Array.from(flat).length !== flat.length) return truncate(flat, max);
+	const start = Math.max(0, at - 70);
+	const end = Math.min(flat.length, start + max);
+	return (start > 0 ? '…' : '') + flat.slice(start, end).trim() + (end < flat.length ? '…' : '');
 }
 
 /**
@@ -604,6 +695,8 @@ export type PhraseEvidenceDetail = {
 	textOnlyGate: TextOnlyGate;
 	/** TASK-0013 paso 3: empresas de una sola vía «similar a» quitadas para esta frase (ver `applySingleSimilarGate`). */
 	singleSimilarGate: SingleSimilarGate;
+	/** TASK-0029: solo con `grupos`. Evidencia de capacidades y de experiencias, fusionadas por separado. */
+	groups?: { capacidad: GroupEvidence; experiencia: GroupEvidence };
 };
 
 /** Fase 23B: envuelve una promesa de señal para medir su duración sin alterar cuándo se resuelve ni su valor - el `Promise.all` de abajo sigue esperando exactamente las mismas promesas, en paralelo, en el mismo orden. */
@@ -615,14 +708,19 @@ function timed<T>(timingsMs: Record<string, number>, label: string, promise: Pro
 	});
 }
 
-export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env: Env, phrase: string): Promise<PhraseEvidenceDetail> {
+export async function computePhraseEvidence(
+	sql: ReturnType<typeof getSql>,
+	env: Env,
+	phrase: string,
+	opts: PhraseOptions = {}
+): Promise<PhraseEvidenceDetail> {
 	const timingsMs: Record<string, number> = {};
 	const vector = await embedPhrase(env, phrase);
 
 	const legacyRows = legacySectorServiceRows(sql, '%' + phrase + '%');
 	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
 		timed(timingsMs, 'structured', legacyRows.then((legacy) => structuredList(sql, phrase, legacy))),
-		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase)),
+		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase, !!opts.grupos)),
 		timed(timingsMs, 'lexical_taxonomy', lexicalTaxonomyList(sql, phrase)),
 		timed(timingsMs, 'fulltext', fullTextList(sql, phrase)),
 		vector ? timed(timingsMs, 'service', vectorServiceList(sql, vector, phrase)) : Promise.resolve([]),
@@ -675,11 +773,6 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 		sector_focus: sectorFocusList(await legacyRows, phrase),
 	};
 
-	const textOnlyGate = applyTextOnlyGate(namedLists);
-	const singleSimilarGate = applySingleSimilarGate(namedLists);
-
-	const result = new Map<number, FusedEvidence>();
-	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
 	// Fase 24, Fase 2 (evidence layering, punto 9 del pedido): multiplicador GENERAL adicional sobre
 	// el peso de `canonical_related` en la fusión RRF - independiente de `level5_fallback_penalty`
 	// (que ya descuenta el weight de CADA match L5 dentro de `canonical-expansion.ts`). Da un segundo
@@ -688,6 +781,57 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 	// actual mientras `related_candidates_parallel_enabled` esté OFF (canonical_related casi siempre
 	// vacío en ese modo, así que el multiplicador no tiene nada que multiplicar).
 	const genericRelationPenalty = weightOf(settings, 'mcp_canonical.generic_relation_penalty', 1.0);
+
+	if (opts.grupos) {
+		// TASK-0029: dos fusiones separadas. Capacidades: las listas de catálogo y el texto del perfil que coincide
+		// sin experiencias; las compuertas se aplican solo sobre ellas (como la variante A de la auditoría).
+		// Experiencias: listas literal y por significado, más el texto del perfil que solo coincide por
+		// experiencias; sin compuertas, porque se muestran en su propio grupo y no compiten con el catálogo.
+		const ftIds = Array.from(new Set(fulltext.map((r) => Number(r.empresa_id))));
+		const catalogFt = await timed(timingsMs, 'fulltext_origen', fulltextCatalogIds(sql, phrase, ftIds));
+		const empty = Object.fromEntries(Object.keys(namedLists).map((k) => [k, [] as Evidence[]])) as unknown as Record<EvidenceList, Evidence[]>;
+		const capLists: Record<EvidenceList, Evidence[]> = {
+			...namedLists,
+			lexical_experiencia: [],
+			experiencia: [],
+			fulltext: fulltext.filter((r) => catalogFt.has(Number(r.empresa_id))),
+		};
+		const expLists: Record<EvidenceList, Evidence[]> = {
+			...empty,
+			lexical_experiencia: lexExp,
+			experiencia,
+			fulltext: fulltext.filter((r) => !catalogFt.has(Number(r.empresa_id))),
+		};
+		const textOnlyGate = applyTextOnlyGate(capLists);
+		const singleSimilarGate = applySingleSimilarGate(capLists);
+		const capacidad = { namedLists: capLists, ...fuseNamedLists(capLists, genericRelationPenalty) };
+		const experienciaGroup = { namedLists: expLists, ...fuseNamedLists(expLists, genericRelationPenalty) };
+		return {
+			namedLists: capLists,
+			canonicalCtx,
+			result: capacidad.result,
+			perEmpresaContributions: capacidad.perEmpresaContributions,
+			timingsMs,
+			textOnlyGate,
+			singleSimilarGate,
+			groups: { capacidad, experiencia: experienciaGroup },
+		};
+	}
+
+	const textOnlyGate = applyTextOnlyGate(namedLists);
+	const singleSimilarGate = applySingleSimilarGate(namedLists);
+	const { result, perEmpresaContributions } = fuseNamedLists(namedLists, genericRelationPenalty);
+
+	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs, textOnlyGate, singleSimilarGate };
+}
+
+/** Fusión RRF ponderada de las listas de UNA frase (el bucle de siempre, extraído para poder fusionar los dos grupos de TASK-0029). */
+function fuseNamedLists(
+	namedLists: Record<EvidenceList, Evidence[]>,
+	genericRelationPenalty: number
+): { result: Map<number, FusedEvidence>; perEmpresaContributions: Map<number, Partial<Record<EvidenceList, number>>> } {
+	const result = new Map<number, FusedEvidence>();
+	const perEmpresaContributions = new Map<number, Partial<Record<EvidenceList, number>>>();
 
 	for (const [listName, rows] of Object.entries(namedLists) as [EvidenceList, Evidence[]][]) {
 		const weight = listName === 'canonical_related' ? LIST_WEIGHTS[listName] * genericRelationPenalty : LIST_WEIGHTS[listName];
@@ -729,7 +873,7 @@ export async function computePhraseEvidence(sql: ReturnType<typeof getSql>, env:
 		}
 	}
 
-	return { namedLists, canonicalCtx, result, perEmpresaContributions, timingsMs, textOnlyGate, singleSimilarGate };
+	return { result, perEmpresaContributions };
 }
 
 /**

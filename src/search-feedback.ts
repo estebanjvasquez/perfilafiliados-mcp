@@ -66,6 +66,10 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 		v == null ? null : JSON.stringify(v).length > max ? { truncated: true } : v;
 	const evidence = capped(b.result_evidence, 200_000);
 	const params = capped(b.agent_params, 20_000);
+	// TASK-0029: el registro guarda también la versión del Worker que atendió la búsqueda (antes engine_version
+	// era un texto fijo del flujo y no distinguía versiones, TASK-0028 §1.3). Solo se agrega a filas nuevas.
+	const workerVersion = env.CF_VERSION_METADATA?.id ? `worker ${env.CF_VERSION_METADATA.id.slice(0, 8)}` : null;
+	const engineVersion = [str(b.engine_version, 160), workerVersion].filter(Boolean).join(' | ').slice(0, 200) || null;
 
 	const sql = getSql(env);
 	try {
@@ -76,7 +80,7 @@ export async function handleSearchLog(request: Request, env: Env): Promise<Respo
 			values
 				(${source}, ${str(b.session_ref, 200)}, ${str(b.visitor_ref, 200)}, ${str(b.n8n_execution_id, 100)},
 				 ${userInput}, ${str(b.agent_tool, 50)}, ${params == null ? null : sql.json(params as never)}, ${str(b.interpretation, 50)}, ${ids.length},
-				 ${idsLiteral}::bigint[], ${evidence == null ? null : sql.json(evidence as never)}, ${str(b.engine_version, 200)}, ${responseMs}, ${str(b.error, 2000)})
+				 ${idsLiteral}::bigint[], ${evidence == null ? null : sql.json(evidence as never)}, ${engineVersion}, ${responseMs}, ${str(b.error, 2000)})
 			returning id
 		`;
 		return Response.json({ ok: true, id: Number(row.id) });

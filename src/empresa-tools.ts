@@ -4,6 +4,7 @@ import type { Env } from './index';
 import { getSql } from './db';
 import { computePhraseEvidence, mergePhraseEvidence, rankedIds, countDirectCompanies, debugCanonicalSearch, compareTierThenScore, TIER_NAME } from './hybrid-search';
 import { buildExplanations } from './search-explain';
+import { searchTwoGroups } from './two-groups';
 
 /**
  * Fase MCP-3 (ver docs/taxonomia/plan_mcp_cira.md de PerfilAfiliadosCPV): `search_empresas` y
@@ -362,6 +363,15 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							'del perfil...), el aporte de cada una y el puntaje con el que quedó ordenada. No cambia el ' +
 							'orden, el corte ni los resultados.'
 					),
+				grupos: z
+					.boolean()
+					.optional()
+					.describe(
+						'Uso de presentación (CIRA de pruebas, TASK-0029): si es true, separa el resultado en dos grupos, ' +
+							'primero "capacidad" (coincide su catálogo: servicio, sector, categoría CPV...) y después ' +
+							'"experiencia" (solo coincide en proyectos ejecutados). Cada fila trae "grupo", "capacidad" y ' +
+							'"experiencias_relacionadas". Sin este parámetro la respuesta no cambia.'
+					),
 				debug: z
 					.boolean()
 					.optional()
@@ -372,7 +382,7 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 					),
 			},
 		},
-		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases, explain, debug }) => {
+		async ({ query, sector, ciudad, categoria_codigo, tipo_oferta, limit, resolvedPhrases, explain, grupos, debug }) => {
 			if (!query && !sector && !ciudad && !categoria_codigo) {
 				return {
 					content: [
@@ -468,6 +478,29 @@ export function registerEmpresaTools(server: McpServer, env: Env): void {
 							: {}),
 					}));
 					return { content: [{ type: 'text' as const, text: JSON.stringify(tagged, null, 2) }] };
+				}
+
+				// TASK-0029: alternativa B (dos grupos), solo si se pide. Mismo filtro de empresas activas y de
+				// sector/ciudad/categoría que el camino de siempre.
+				if (grupos) {
+					const grouped = await searchTwoGroups(
+						sql,
+						env,
+						query,
+						resolvedPhrases,
+						{ max, exactMax },
+						async (ids) => {
+							if (ids.length === 0) return [];
+							const conditions = [sql`e.status_id = 1`, sql`e.id in ${sql(ids)}`, ...structuredFilters()];
+							const where = conditions.reduce((acc, c) => sql`${acc} and ${c}`);
+							return sql<EmpresaSearchRow[]>`
+								${empresaSelectAndJoins(sql)}
+								where ${where}
+							`;
+						},
+						!!explain
+					);
+					return { content: [{ type: 'text' as const, text: JSON.stringify(grouped, null, 2) }] };
 				}
 
 				// Con "query": buscador híbrido de Fase MCP-7 (SQL estructurado + full-text + vectorial +
