@@ -55,17 +55,21 @@ const marks = (s: string) => (s.normalize('NFD').match(/\p{M}/gu) ?? []).length;
  * `balancín` se puntuaban dos veces). Conserva el orden de aparición (la primera sigue siendo la de `query`) y,
  * de cada variante, la escrita con tildes, que es la que mejor representa el embedding en español.
  */
-export function dedupPhrases(phrases: string[]): string[] {
-	const byKey = new Map<string, string>();
+export function dedupPhrases(phrases: string[]): { frase: string; variantes: string[] }[] {
+	const byKey = new Map<string, string[]>();
 	for (const raw of phrases) {
 		if (typeof raw !== 'string') continue;
 		const p = raw.trim().replace(/\s+/g, ' ');
 		if (!p) continue;
 		const k = fold(p);
-		const prev = byKey.get(k);
-		if (prev === undefined || marks(p) > marks(prev)) byKey.set(k, p);
+		const arr = byKey.get(k) ?? [];
+		if (!arr.includes(p)) arr.push(p);
+		byKey.set(k, arr);
 	}
-	return Array.from(byKey.values());
+	return Array.from(byKey.values()).map((all) => {
+		const frase = all.reduce((best, p) => (marks(p) > marks(best) ? p : best), all[0]);
+		return { frase, variantes: all.filter((p) => p !== frase) };
+	});
 }
 
 export type Capacidad = {
@@ -261,9 +265,10 @@ export async function searchTwoGroups<R extends { id: number | string }>(
 	fetchRows: (ids: string[]) => Promise<R[]>,
 	explain: boolean
 ): Promise<TwoGroupRow<R>[]> {
-	const phrases = dedupPhrases([query, ...(resolvedPhrases ?? [])]);
-	if (phrases.length === 0) return [];
-	const details = await Promise.all(phrases.map((p) => computePhraseEvidence(sql, env, p, { grupos: true })));
+	const groupsOfPhrases = dedupPhrases([query, ...(resolvedPhrases ?? [])]);
+	if (groupsOfPhrases.length === 0) return [];
+	const phrases = groupsOfPhrases.map((g) => g.frase);
+	const details = await Promise.all(groupsOfPhrases.map((g) => computePhraseEvidence(sql, env, g.frase, { grupos: true, variantes: g.variantes })));
 
 	const capMerged = mergePhraseEvidence(details.map((d) => d.groups!.capacidad.result));
 	const expMerged = mergePhraseEvidence(details.map((d) => d.groups!.experiencia.result));

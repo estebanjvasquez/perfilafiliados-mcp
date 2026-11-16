@@ -178,7 +178,34 @@ export type Evidence = {
  * viene de experiencias) y experiencias (literal, por significado y el texto del perfil que solo coincide en
  * experiencias), cada una fusionada por su lado, sin mezclar puntajes.
  */
-export type PhraseOptions = { grupos?: boolean };
+export type PhraseOptions = {
+	grupos?: boolean;
+	/**
+	 * TASK-0029: otras escrituras de la misma frase (solo cambian tildes o mayúsculas). Las listas léxicas y de texto
+	 * ya ignoran tildes, así que se calculan una vez; los embeddings sí cambian (medido: «camion chupon» encuentra
+	 * una experiencia que «camión chupón» no), así que las listas vectoriales se calculan con cada escritura y se
+	 * intercalan, sin sumar dos veces.
+	 */
+	variantes?: string[];
+};
+
+/** Intercala listas ordenadas (1.º de cada una, 2.º de cada una...), sin repetir empresa y con el mismo tope. */
+function interleave(lists: Evidence[][], limit: number): Evidence[] {
+	if (lists.length === 1) return lists[0];
+	const out: Evidence[] = [];
+	const seen = new Set<string>();
+	const max = Math.max(0, ...lists.map((l) => l.length));
+	for (let i = 0; i < max && out.length < limit; i++) {
+		for (const l of lists) {
+			const r = l[i];
+			if (!r || seen.has(String(r.empresa_id))) continue;
+			seen.add(String(r.empresa_id));
+			out.push(r);
+			if (out.length >= limit) break;
+		}
+	}
+	return out;
+}
 
 /** Listas que solo describen experiencias (proyectos ejecutados). */
 export const EXPERIENCE_LISTS: ReadonlySet<EvidenceList> = new Set(['lexical_experiencia', 'experiencia']);
@@ -716,6 +743,22 @@ export async function computePhraseEvidence(
 ): Promise<PhraseEvidenceDetail> {
 	const timingsMs: Record<string, number> = {};
 	const vector = await embedPhrase(env, phrase);
+	// TASK-0029: con variantes de escritura, un embedding por variante (solo en el modo de dos grupos).
+	const variantVectors: [string, string][] = [];
+	if (opts.grupos && opts.variantes?.length) {
+		const extra = await Promise.all(opts.variantes.map(async (v) => [await embedPhrase(env, v), v] as const));
+		for (const [vec, v] of extra) if (vec) variantVectors.push([vec, v]);
+	}
+	const vectorList = (
+		label: string,
+		fn: (sql: ReturnType<typeof getSql>, vector: string, phrase: string) => Promise<Evidence[]>,
+		limit: number
+	): Promise<Evidence[]> => {
+		const pairs: [string, string][] = [...(vector ? [[vector, phrase] as [string, string]] : []), ...variantVectors];
+		if (pairs.length === 0) return Promise.resolve([]);
+		if (pairs.length === 1) return timed(timingsMs, label, fn(sql, pairs[0][0], pairs[0][1]));
+		return timed(timingsMs, label, Promise.all(pairs.map(([vec, p]) => fn(sql, vec, p))).then((ls) => interleave(ls, limit)));
+	};
 
 	const legacyRows = legacySectorServiceRows(sql, '%' + phrase + '%');
 	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
@@ -723,9 +766,9 @@ export async function computePhraseEvidence(
 		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase, !!opts.grupos)),
 		timed(timingsMs, 'lexical_taxonomy', lexicalTaxonomyList(sql, phrase)),
 		timed(timingsMs, 'fulltext', fullTextList(sql, phrase)),
-		vector ? timed(timingsMs, 'service', vectorServiceList(sql, vector, phrase)) : Promise.resolve([]),
-		vector ? timed(timingsMs, 'taxonomy', vectorTaxonomyList(sql, vector, phrase)) : Promise.resolve([]),
-		vector ? timed(timingsMs, 'experiencia', vectorExperienciaList(sql, vector, phrase)) : Promise.resolve([]),
+		vectorList('service', vectorServiceList, SERVICE_VECTOR_LIMIT),
+		vectorList('taxonomy', vectorTaxonomyList, TAXONOMY_VECTOR_LIMIT),
+		vectorList('experiencia', vectorExperienciaList, EXPERIENCIA_VECTOR_LIMIT),
 		timed(timingsMs, 'canonical_resolver', resolveCanonicalQueryWithSql(sql, phrase)),
 	]);
 
@@ -787,23 +830,27 @@ export async function computePhraseEvidence(
 		// sin experiencias; las compuertas se aplican solo sobre ellas (como la variante A de la auditoría).
 		// Experiencias: listas literal y por significado, más el texto del perfil que solo coincide por
 		// experiencias; sin compuertas, porque se muestran en su propio grupo y no compiten con el catálogo.
-		const ftIds = Array.from(new Set(fulltext.map((r) => Number(r.empresa_id))));
+		// Compuerta «similar a» única sobre TODAS las listas, igual que el camino de siempre: si la frase tiene
+		// evidencia más fuerte (aunque sea en experiencias), las empresas de una sola vía «similar a» no entran.
+		// Medido: aplicada solo al catálogo, dejaba pasar «servicio parecido» de una sola vía cuando la evidencia
+		// fuerte estaba en experiencias (ruido en el top 5 de 27 a 30 en las consultas etiquetadas).
+		const singleSimilarGate = applySingleSimilarGate(namedLists);
+		const ftIds = Array.from(new Set(namedLists.fulltext.map((r) => Number(r.empresa_id))));
 		const catalogFt = await timed(timingsMs, 'fulltext_origen', fulltextCatalogIds(sql, phrase, ftIds));
 		const empty = Object.fromEntries(Object.keys(namedLists).map((k) => [k, [] as Evidence[]])) as unknown as Record<EvidenceList, Evidence[]>;
 		const capLists: Record<EvidenceList, Evidence[]> = {
 			...namedLists,
 			lexical_experiencia: [],
 			experiencia: [],
-			fulltext: fulltext.filter((r) => catalogFt.has(Number(r.empresa_id))),
+			fulltext: namedLists.fulltext.filter((r) => catalogFt.has(Number(r.empresa_id))),
 		};
 		const expLists: Record<EvidenceList, Evidence[]> = {
 			...empty,
-			lexical_experiencia: lexExp,
-			experiencia,
-			fulltext: fulltext.filter((r) => !catalogFt.has(Number(r.empresa_id))),
+			lexical_experiencia: namedLists.lexical_experiencia,
+			experiencia: namedLists.experiencia,
+			fulltext: namedLists.fulltext.filter((r) => !catalogFt.has(Number(r.empresa_id))),
 		};
 		const textOnlyGate = applyTextOnlyGate(capLists);
-		const singleSimilarGate = applySingleSimilarGate(capLists);
 		const capacidad = { namedLists: capLists, ...fuseNamedLists(capLists, genericRelationPenalty) };
 		const experienciaGroup = { namedLists: expLists, ...fuseNamedLists(expLists, genericRelationPenalty) };
 		return {
