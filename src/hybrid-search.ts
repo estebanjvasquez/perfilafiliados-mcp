@@ -400,36 +400,38 @@ function sectorFocusList(rows: LegacyRow[], phrase: string): Evidence[] {
 	return out;
 }
 
-async function structuredList(sql: ReturnType<typeof getSql>, phrase: string, legacy: LegacyRow[]): Promise<Evidence[]> {
+async function structuredList(sql: ReturnType<typeof getSql>, phrase: string, legacyP: Promise<LegacyRow[]>): Promise<Evidence[]> {
 	const like = '%' + phrase + '%';
-	const nameRows =
-		phrase.length >= NAME_SUBSTRING_MIN_LENGTH
-			? await sql<{ empresa_id: number }[]>`
-				select distinct e.id as empresa_id
-				from empresas e
-				where e.status_id = 1 and unaccent(e.name) ilike unaccent(${like})
-			`
-			: [];
-
-	const serviceSectorRows = legacy.map((r) => ({ empresa_id: r.empresa_id }));
-
 	const normalized = phrase.toLowerCase().replace(/[^a-z0-9]/g, '');
 	const certColumns = ['iso9001', 'iso14001', 'iso45001', 'iso27001', 'iso50001', 'iso17025', 'iso37001', 'dun', 'ovid', 'pmi'];
 	const matchedCertColumn = certColumns.find((c) => normalized.includes(c)) ?? null;
 
-	const certRows = matchedCertColumn
-		? await sql<{ empresa_id: number }[]>`select empresa_id from empresa_certifications where ${sql(matchedCertColumn)} = true`
-		: await sql<{ empresa_id: number }[]>`
-			select empresa_id from empresa_certifications
-			where unaccent(coalesce(otras_certificaciones, '')) ilike unaccent(${like})
-		`;
+	// TASK-0031: las cuatro consultas son independientes; antes corrían una detrás de otra (~750 ms en frío).
+	// Se concatenan en el mismo orden de siempre, así que la lista y sus posiciones no cambian.
+	const [nameRows, legacy, certRows, sustRows] = await Promise.all([
+		phrase.length >= NAME_SUBSTRING_MIN_LENGTH
+			? sql<{ empresa_id: number }[]>`
+				select distinct e.id as empresa_id
+				from empresas e
+				where e.status_id = 1 and unaccent(e.name) ilike unaccent(${like})
+			`
+			: Promise.resolve([] as { empresa_id: number }[]),
+		legacyP,
+		matchedCertColumn
+			? sql<{ empresa_id: number }[]>`select empresa_id from empresa_certifications where ${sql(matchedCertColumn)} = true`
+			: sql<{ empresa_id: number }[]>`
+				select empresa_id from empresa_certifications
+				where unaccent(coalesce(otras_certificaciones, '')) ilike unaccent(${like})
+			`,
+		sql<{ empresa_id: number }[]>`
+			select distinct esa.empresa_id
+			from empresa_sustainability_areas esa
+			join sustainability_areas sa on sa.id = esa.area_id
+			where unaccent(sa.name) ilike unaccent(${like}) or unaccent(coalesce(sa.synonyms, '')) ilike unaccent(${like})
+		`,
+	]);
 
-	const sustRows = await sql<{ empresa_id: number }[]>`
-		select distinct esa.empresa_id
-		from empresa_sustainability_areas esa
-		join sustainability_areas sa on sa.id = esa.area_id
-		where unaccent(sa.name) ilike unaccent(${like}) or unaccent(coalesce(sa.synonyms, '')) ilike unaccent(${like})
-	`;
+	const serviceSectorRows = legacy.map((r) => ({ empresa_id: r.empresa_id }));
 
 	const label = matchedCertColumn ? `coincide con la certificación ${matchedCertColumn.toUpperCase()}` : `coincide con "${phrase}"`;
 
@@ -742,30 +744,39 @@ export async function computePhraseEvidence(
 	opts: PhraseOptions = {}
 ): Promise<PhraseEvidenceDetail> {
 	const timingsMs: Record<string, number> = {};
-	const vector = await embedPhrase(env, phrase);
-	// TASK-0029: con variantes de escritura, un embedding por variante (solo en el modo de dos grupos).
-	const variantVectors: [string, string][] = [];
-	if (opts.grupos && opts.variantes?.length) {
-		const extra = await Promise.all(opts.variantes.map(async (v) => [await embedPhrase(env, v), v] as const));
-		for (const [vec, v] of extra) if (vec) variantVectors.push([vec, v]);
-	}
+	// TASK-0031: los embeddings (frase y, con `grupos`, sus variantes de escritura) se piden todos a la vez y en
+	// paralelo con las consultas que no los necesitan; antes cada consulta esperaba al embedding y las variantes
+	// esperaban a la frase. Solo cambia cuándo empieza cada consulta, no qué devuelve ni en qué orden se fusiona.
+	const embeddings = Promise.all(
+		[phrase, ...(opts.grupos ? (opts.variantes ?? []) : [])].map(async (p) => [await embedPhrase(env, p), p] as const)
+	).then((all) => all.filter(([vec]) => !!vec) as [string, string][]);
 	const vectorList = (
 		label: string,
 		fn: (sql: ReturnType<typeof getSql>, vector: string, phrase: string) => Promise<Evidence[]>,
 		limit: number
-	): Promise<Evidence[]> => {
-		const pairs: [string, string][] = [...(vector ? [[vector, phrase] as [string, string]] : []), ...variantVectors];
-		if (pairs.length === 0) return Promise.resolve([]);
-		if (pairs.length === 1) return timed(timingsMs, label, fn(sql, pairs[0][0], pairs[0][1]));
-		return timed(timingsMs, label, Promise.all(pairs.map(([vec, p]) => fn(sql, vec, p))).then((ls) => interleave(ls, limit)));
-	};
+	): Promise<Evidence[]> =>
+		timed(
+			timingsMs,
+			label,
+			embeddings.then((pairs) => {
+				if (pairs.length === 0) return [] as Evidence[];
+				if (pairs.length === 1) return fn(sql, pairs[0][0], pairs[0][1]);
+				return Promise.all(pairs.map(([vec, p]) => fn(sql, vec, p))).then((ls) => interleave(ls, limit));
+			})
+		);
 
 	const legacyRows = legacySectorServiceRows(sql, '%' + phrase + '%');
+	const fulltextP = timed(timingsMs, 'fulltext', fullTextList(sql, phrase));
+	// TASK-0031: con `grupos`, la clasificación del texto completo (catálogo frente a experiencias) empieza apenas
+	// llega esa lista, en paralelo con el resto. Usa los mismos ids que antes: la compuerta «similar a» no toca `fulltext`.
+	const catalogFtP = opts.grupos
+		? fulltextP.then((ft) => timed(timingsMs, 'fulltext_origen', fulltextCatalogIds(sql, phrase, Array.from(new Set(ft.map((r) => Number(r.empresa_id)))))))
+		: null;
 	const [structured, lexExp, lexTax, fulltext, service, taxonomy, experiencia, canonicalCtx] = await Promise.all([
-		timed(timingsMs, 'structured', legacyRows.then((legacy) => structuredList(sql, phrase, legacy))),
+		timed(timingsMs, 'structured', structuredList(sql, phrase, legacyRows)),
 		timed(timingsMs, 'lexical_experiencia', lexicalExperienciaList(sql, phrase, !!opts.grupos)),
 		timed(timingsMs, 'lexical_taxonomy', lexicalTaxonomyList(sql, phrase)),
-		timed(timingsMs, 'fulltext', fullTextList(sql, phrase)),
+		fulltextP,
 		vectorList('service', vectorServiceList, SERVICE_VECTOR_LIMIT),
 		vectorList('taxonomy', vectorTaxonomyList, TAXONOMY_VECTOR_LIMIT),
 		vectorList('experiencia', vectorExperienciaList, EXPERIENCIA_VECTOR_LIMIT),
@@ -835,8 +846,7 @@ export async function computePhraseEvidence(
 		// Medido: aplicada solo al catálogo, dejaba pasar «servicio parecido» de una sola vía cuando la evidencia
 		// fuerte estaba en experiencias (ruido en el top 5 de 27 a 30 en las consultas etiquetadas).
 		const singleSimilarGate = applySingleSimilarGate(namedLists);
-		const ftIds = Array.from(new Set(namedLists.fulltext.map((r) => Number(r.empresa_id))));
-		const catalogFt = await timed(timingsMs, 'fulltext_origen', fulltextCatalogIds(sql, phrase, ftIds));
+		const catalogFt = await catalogFtP!;
 		const empty = Object.fromEntries(Object.keys(namedLists).map((k) => [k, [] as Evidence[]])) as unknown as Record<EvidenceList, Evidence[]>;
 		const capLists: Record<EvidenceList, Evidence[]> = {
 			...namedLists,
